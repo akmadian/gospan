@@ -30,7 +30,7 @@ type Event struct {
 	Name     string      // set on EventStart and EventEnd
 	StartNS  int64       // unix nanoseconds; set on EventStart and EventEnd
 	EndNS    int64       // unix nanoseconds; set on EventEnd
-	Status   Status      // set on EventEnd
+	Status   SpanStatus  // set on EventEnd
 	Error    string      // set on EventEnd when Fail recorded an error
 	Attrs    []slog.Attr // set on EventStart and EventAttrs
 }
