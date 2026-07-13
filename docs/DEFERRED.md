@@ -84,3 +84,13 @@ Keys are inline TEXT (deliberate asymmetry with interned span names).
 "Queue depth over time" as sampled values. v1 derives it from open-span
 counts (window queries over intervals), which covers the motivating cases.
 **Trigger:** a want that span-derived concurrency genuinely cannot express.
+
+## Live snapshot handler (`serve`)
+The `http.Handler` exposing a consistent `VACUUM INTO` snapshot of the
+live DB at `/trace.db` (D9, D24) — in the `gospan/sqlite` module, since
+it is meaningless without a database file. Deferred out of v1: its only
+consumer is the viewer's live-ish mode (D26). Snapshots should run on
+their own read connection so a slow copy never stalls the writer.
+**Trigger:** the viewer repository lands and wants live mode — or a real
+mid-run diagnosis need that opening the live WAL file locally cannot
+serve.

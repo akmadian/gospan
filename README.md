@@ -80,10 +80,11 @@ slog.Info("extract", "p90", sum.P90, "count", sum.Count, "errors", sum.Errors)
 
 ## What it is / is not
 
-**Is:** in-process span collection → batched writes to a local SQLite file
-(WAL, pure-Go driver) → a self-contained HTML viewer and your own SQL.
-Semaphore waits, subprocess calls, DB writes, queue waits — anything with a
-start and an end is a span. Destinations sit behind a small public sink
+### Is:
+* In-process span monitoring: No external Postgres or Prometheus procs to manage.
+* Monitoring for semaphore waits, subprocess calls, DB writes, queue waits — anything with a
+start and an end is a span.
+* Destinations sit behind a small public sink
 interface (the `slog.Handler` pattern): in-tree, the SQLite file (a nested
 module — **core itself has zero third-party dependencies**) and a stdlib-only
 slog emitter; anything heavier lives out of tree, in its own module, so no
@@ -91,10 +92,16 @@ one's build ever pays for a destination they don't use. The viewer is its own
 repository, reading trace files and live snapshots against the published
 schema contract.
 
-**Is not:** distributed tracing (no cross-process propagation — that's
-OpenTelemetry's job), a log aggregator, a metrics server, or a durable job
-queue. Any number of processes can each run gospan; each traces itself into
-its own file, and we never stitch them into one causal tree.
+### Is not:
+* Distributed tracing (no cross-process propagation — that's OpenTelemetry's job)
+* A log aggregator
+* A metrics server
+* A durable job queue
+
+
+## Features
+* Pure stdlib core - with core and slog sink only, only gospan enters your mod file.
+* Panic and error isolation, with testing to back it.
 
 ## Guarantees
 

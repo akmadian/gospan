@@ -244,3 +244,11 @@ workloads may want sparser than 128. The default stays 128; the cadence
 check moves from a bitmask to a modulo (a nanosecond-scale cost, and the
 mask's power-of-two restriction would leak into the API). Requested by Ari
 during the chunk-6 review.
+
+**D26 — `serve` deferred out of v1.** The founding round placed the live
+snapshot handler in v1 core (D9); implementation reached it last, and its
+only consumer — the viewer's live polling mode — has no repository yet.
+Slightly off the core path, so it moves to DEFERRED.md with the viewer as
+its trigger. Nothing in the write path or schema changes when it lands:
+the file is the interface either way, and D24's `VACUUM INTO` mechanism
+stands. Requested by Ari during the implementation round.
