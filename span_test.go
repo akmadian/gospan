@@ -140,6 +140,77 @@ func TestSetAttrsEmitsDelta(t *testing.T) {
 	}
 }
 
+func TestDeferredEndRunsOnCallerPanic(t *testing.T) {
+	// SPEC §2 panic safety: a deferred End runs during the caller's panic
+	// unwind, so the span gets an end time — and gospan never swallows the
+	// caller's panic (it must reach our recover here).
+	tracer, capture := newCaptureTracer(t)
+
+	recovered := func() (recovered any) {
+		defer func() { recovered = recover() }()
+		func() {
+			_, span := tracer.Start(context.Background(), "doomed")
+			defer span.End()
+			panic("caller bug")
+		}()
+		return nil
+	}()
+	if recovered != "caller bug" {
+		t.Fatalf("the caller's panic must propagate untouched, recovered %v", recovered)
+	}
+	mustClose(t, tracer)
+
+	ends := eventsOfKind(capture.snapshot(), EventEnd)
+	if len(ends) != 1 || ends[0].Name != "doomed" {
+		t.Fatalf("a span abandoned by panic must still get its end event, got %v", ends)
+	}
+	if ends[0].Status != SpanStatusOK {
+		t.Errorf("Status = %v — a panic is never diagnosed into a status the data can't back", ends[0].Status)
+	}
+}
+
+func TestSpanStatusString(t *testing.T) {
+	tests := []struct {
+		status SpanStatus
+		want   string
+	}{
+		{SpanStatusOK, "ok"},
+		{SpanStatusError, "error"},
+		{SpanStatusCanceled, "canceled"},
+		{SpanStatus(9), "status(9)"}, // future enum values format, never lie
+	}
+	for _, tc := range tests {
+		if got := tc.status.String(); got != tc.want {
+			t.Errorf("SpanStatus(%d).String() = %q, want %q", int(tc.status), got, tc.want)
+		}
+	}
+}
+
+// panickingError is the user-code seam inside Fail: err.Error() runs in
+// our call path, and a bug there must never crash the traced program.
+type panickingError struct{}
+
+func (panickingError) Error() string { panic("buggy user error type") }
+
+func TestFailSurvivesPanickingErrorType(t *testing.T) {
+	tracer, capture := newCaptureTracer(t)
+	_, span := tracer.Start(context.Background(), "work")
+
+	span.Fail(panickingError{}) // guard must contain the user type's bug right here
+	span.End()
+	mustClose(t, tracer)
+
+	ends := eventsOfKind(capture.snapshot(), EventEnd)
+	if len(ends) != 1 {
+		t.Fatalf("the span must stay healthy after a contained Fail panic, got %d end events", len(ends))
+	}
+	// The panic aborted Fail before anything was recorded; the span ends
+	// clean rather than carrying a half-written verdict.
+	if ends[0].Status != SpanStatusOK || ends[0].Error != "" {
+		t.Errorf("aborted Fail must record nothing, got status %v error %q", ends[0].Status, ends[0].Error)
+	}
+}
+
 func TestCrossGoroutineMutationsAreSafe(t *testing.T) {
 	tracer, capture := newCaptureTracer(t, WithBufferSize(1024))
 	_, span := tracer.Start(context.Background(), "work")

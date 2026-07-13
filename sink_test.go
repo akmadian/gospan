@@ -209,6 +209,50 @@ func TestMultiSinkOneFailureNeverStarvesTheRest(t *testing.T) {
 	}
 }
 
+func TestMultiSinkJoinsCloseErrors(t *testing.T) {
+	failing, healthy := &closeErrorSink{}, &captureSink{}
+	sink := MultiSink(failing, healthy)
+
+	err := sink.Close()
+	if !errors.Is(err, errSinkClose) {
+		t.Errorf("Close = %v, want the failing member's error joined in", err)
+	}
+	if _, _, closes := healthy.counts(); closes != 1 {
+		t.Error("one member's Close failure must not starve the rest")
+	}
+}
+
+func TestMultiSinkJoinsFlushErrors(t *testing.T) {
+	failing, healthy := &flushErrorSink{}, &captureSink{}
+	sink := MultiSink(failing, healthy)
+
+	if err := sink.Flush(); !errors.Is(err, errFlushFailed) {
+		t.Errorf("Flush = %v, want the failing member's error joined in", err)
+	}
+	if _, flushes, _ := healthy.counts(); flushes != 1 {
+		t.Error("one member's Flush failure must not starve the rest")
+	}
+}
+
+func TestSlogSinkNilLoggerFallsBackToDefault(t *testing.T) {
+	// The documented contract: SlogSink(nil) uses slog.Default.
+	handler := &recordingHandler{}
+	previous := slog.Default()
+	slog.SetDefault(slog.New(handler))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	sink := SlogSink(nil)
+	err := sink.WriteBatch(Batch{Events: []Event{{
+		Kind: EventEnd, SpanID: 1, TraceID: 1, Name: "work", StartNS: 1, EndNS: 2,
+	}}})
+	if err != nil {
+		t.Fatalf("WriteBatch: %v", err)
+	}
+	if records := handler.snapshot(); len(records) != 1 {
+		t.Errorf("SlogSink(nil) must emit via slog.Default, got %d records", len(records))
+	}
+}
+
 func TestMultiSinkToleratesNilAndEmpty(t *testing.T) {
 	empty := MultiSink()
 	if err := empty.WriteBatch(Batch{}); err != nil {

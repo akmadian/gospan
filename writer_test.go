@@ -43,6 +43,18 @@ func (sink *closeErrorSink) Close() error {
 	return errSinkClose
 }
 
+// flushErrorSink accepts batches but fails every commit — the shape of a
+// buffering sink whose disk went away between writes.
+type flushErrorSink struct {
+	captureSink
+}
+
+var errFlushFailed = errors.New("commit failed")
+
+func (sink *flushErrorSink) Flush() error {
+	return errFlushFailed
+}
+
 func TestWriterDeliversInOrder(t *testing.T) {
 	tracer, capture := newCaptureTracer(t)
 	const spans = 100
@@ -194,6 +206,29 @@ func TestSinkErrorsCountedAndContained(t *testing.T) {
 	}
 	if _, _, closes := sink.counts(); closes != 1 {
 		t.Error("a failing WriteBatch must not kill the writer — Close must still reach the sink")
+	}
+}
+
+func TestFlushErrorsCountedAndContained(t *testing.T) {
+	// A failed Flush is where a buffering sink's lost commit becomes
+	// visible (the Stats.Written docs hang on this), so it must count as
+	// a WriteError without killing the writer.
+	sink := &flushErrorSink{}
+	tracer, err := New(sink)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	tracer.Start(context.Background(), "work")
+	mustClose(t, tracer)
+
+	if got := tracer.Stats().WriteErrors; got < 1 {
+		t.Errorf("WriteErrors = %d, want at least 1 for the failed flush", got)
+	}
+	if events := sink.snapshot(); len(events) != 1 {
+		t.Errorf("batch delivery must be unaffected by flush failures, captured %d events", len(events))
+	}
+	if _, _, closes := sink.counts(); closes != 1 {
+		t.Error("a failing Flush must not stop Close from reaching the sink")
 	}
 }
 

@@ -5,5 +5,6 @@ check:
 	go vet ./...
 	golangci-lint run
 	go test -race ./...
+	go test -run TestAllocationCeilings ./...  # alloc gate needs a non-race build
 
 .PHONY: check

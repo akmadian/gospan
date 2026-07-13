@@ -401,6 +401,85 @@ func TestDefaultTracerMirrors(t *testing.T) {
 	}
 }
 
+// panickingHandler is the broken user logger — the complaint channel
+// itself as a crash vector.
+type panickingHandler struct{}
+
+func (panickingHandler) Enabled(context.Context, slog.Level) bool  { return true }
+func (panickingHandler) Handle(context.Context, slog.Record) error { panic("buggy user handler") }
+func (panickingHandler) WithAttrs([]slog.Attr) slog.Handler        { return panickingHandler{} }
+func (panickingHandler) WithGroup(string) slog.Handler             { return panickingHandler{} }
+
+func TestPanickingLoggerNeverKillsTheWriter(t *testing.T) {
+	// An erroring sink makes the writer warn; the warn's handler panics.
+	// Without warn's self-shield that panic escapes recoverSinkPanic and
+	// kills the writer goroutine — and with it, the process.
+	sink := &errorSink{}
+	tracer, err := New(sink, WithLogger(slog.New(panickingHandler{})))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	tracer.Start(context.Background(), "work")
+
+	// If the writer died, this Close never completes — the timeout turns
+	// a hang into a loud failure.
+	closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := tracer.Close(closeCtx); err != nil {
+		t.Fatalf("Close = %v — the writer must survive a panicking logger", err)
+	}
+	if got := tracer.Stats().WriteErrors; got < 1 {
+		t.Errorf("WriteErrors = %d, want the original sink failure still counted", got)
+	}
+	if _, _, closes := sink.counts(); closes != 1 {
+		t.Error("the sink must still be closed exactly once")
+	}
+}
+
+func TestPanickingLoggerNeverEscapesGuard(t *testing.T) {
+	// The double failure: Fail's user error panics (guard recovers, its
+	// recover now spent), then guard's warn hits the panicking handler.
+	// Without warn's self-shield the second panic propagates into the
+	// caller — this test would die here.
+	tracer, err := New(&captureSink{}, WithLogger(slog.New(panickingHandler{})))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = tracer.Close(context.Background()) })
+
+	_, span := tracer.Start(context.Background(), "work")
+	span.Fail(panickingError{})
+	span.End()
+}
+
+func TestWarnIsRateLimited(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		handler := &recordingHandler{}
+		capture := &captureSink{}
+		tracer, err := New(capture, WithLogger(slog.New(handler)))
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		t.Cleanup(func() { _ = tracer.Close(context.Background()) })
+
+		// Three complaints inside one fake-clock second: exactly one lands.
+		tracer.warn("first")
+		tracer.warn("second")
+		tracer.warn("third")
+		if records := handler.snapshot(); len(records) != 1 || records[0].message != "first" {
+			t.Fatalf("warn must emit once per second, got %v", records)
+		}
+
+		// The next second opens one new slot.
+		time.Sleep(1100 * time.Millisecond)
+		tracer.warn("fourth")
+		tracer.warn("fifth")
+		if records := handler.snapshot(); len(records) != 2 || records[1].message != "fourth" {
+			t.Fatalf("a new second must admit exactly one more warning, got %v", records)
+		}
+	})
+}
+
 func TestTimestampsAreMonotonic(t *testing.T) {
 	tracer, _ := newCaptureTracer(t)
 	first := tracer.now()

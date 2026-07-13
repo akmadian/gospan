@@ -383,5 +383,12 @@ func (tracer *Tracer) warn(msg string, attrs ...slog.Attr) {
 	if now == last || !tracer.lastWarn.CompareAndSwap(last, now) {
 		return
 	}
+	// The logger is user code, and warn runs in the two places a second
+	// panic would escape all containment: inside guard's recover handler
+	// (its recover is already spent) and inside the writer loop (an
+	// unrecovered goroutine panic kills the process). So warn shields
+	// itself — silently, because complaining about the complaint channel
+	// has nowhere left to go; Stats still counted the original failure.
+	defer func() { _ = recover() }()
 	tracer.logger.LogAttrs(context.Background(), slog.LevelWarn, msg, attrs...)
 }
