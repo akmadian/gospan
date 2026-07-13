@@ -66,17 +66,24 @@ type Tracer struct {
 	anchorTime time.Time
 
 	events chan Event
-	stop   chan struct{} // closed by Close; unblocks blocking producers
+	stop   chan struct{} // closed by Close; unblocks blocking producers, tells the writer to drain
+	done   chan struct{} // closed by the writer after drain + sink close; publishes closeErr
 
-	ids      atomic.Int64 // last minted span ID; a root's trace ID is its own span ID
-	dropped  atomic.Uint64
-	closed   atomic.Bool
-	lastWarn atomic.Int64 // unix seconds of the last logger warning
+	// closeErr is the sink's Close error, written by the writer goroutine
+	// strictly before it closes done — reading it after <-done is safe.
+	closeErr error
+
+	ids         atomic.Int64 // last minted span ID; a root's trace ID is its own span ID
+	dropped     atomic.Uint64
+	writeErrors atomic.Uint64
+	closed      atomic.Bool
+	lastWarn    atomic.Int64 // unix seconds of the last logger warning
 }
 
-// New constructs a Tracer that delivers spans to s. Construction is the
-// only place gospan surfaces errors; after New succeeds, nothing gospan
-// does returns an error or panics into the caller.
+// New constructs a Tracer that delivers spans to sink and starts its
+// writer goroutine. Construction is the only place gospan surfaces errors;
+// after New succeeds, nothing gospan does returns an error or panics into
+// the caller.
 func New(sink Sink, options ...Option) (*Tracer, error) {
 	if sink == nil {
 		return nil, errors.New("gospan: New called with nil Sink")
@@ -105,8 +112,36 @@ func New(sink Sink, options ...Option) (*Tracer, error) {
 		anchorTime:    time.Now(),
 		events:        make(chan Event, config.bufferSize),
 		stop:          make(chan struct{}),
+		done:          make(chan struct{}),
 	}
+	go tracer.run()
 	return tracer, nil
+}
+
+// Close drains the buffer, flushes and closes the sink, and makes the
+// Tracer permanently inert — subsequent calls on it are no-ops, and Close
+// itself is idempotent. ctx bounds the wait: on expiry Close returns
+// ctx.Err() immediately while the writer finishes draining and closes the
+// sink in the background (the sink is still closed exactly once).
+func (tracer *Tracer) Close(ctx context.Context) error {
+	if tracer == nil {
+		return nil
+	}
+	defer tracer.guard()
+	// The CAS makes Close idempotent and sequences shutdown: closed flips
+	// first so producers go inert, then stop closes — unblocking any
+	// producer stuck on a full buffer and telling the writer to drain.
+	// A second Close finds closed already true and just waits like the
+	// first one does, so both observe the same completion.
+	if tracer.closed.CompareAndSwap(false, true) {
+		close(tracer.stop)
+	}
+	select {
+	case <-tracer.done:
+		return tracer.closeErr
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // now returns the current time as unix nanoseconds, derived monotonically

@@ -3,53 +3,129 @@ package gospan
 import (
 	"context"
 	"log/slog"
+	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
-// nopSink satisfies New; chunk-2 tests observe the event channel directly,
-// so nothing ever drains into it.
-type nopSink struct{}
+// captureSink records everything the writer delivers. Its own mutex makes
+// it readable from the test goroutine while the writer runs; per the Sink
+// contract it copies what it keeps and never retains the Batch.
+type captureSink struct {
+	mutex   sync.Mutex
+	events  []Event
+	batches int
+	flushes int
+	closes  int
+}
 
-func (nopSink) WriteBatch(Batch) error { return nil }
-func (nopSink) Flush() error           { return nil }
-func (nopSink) Close() error           { return nil }
+func (sink *captureSink) WriteBatch(batch Batch) error {
+	sink.mutex.Lock()
+	defer sink.mutex.Unlock()
+	sink.batches++
+	for _, event := range batch.Events {
+		copied := event
+		copied.Attrs = append([]slog.Attr(nil), event.Attrs...)
+		sink.events = append(sink.events, copied)
+	}
+	return nil
+}
 
-func newTestTracer(t *testing.T, opts ...Option) *Tracer {
+func (sink *captureSink) Flush() error {
+	sink.mutex.Lock()
+	defer sink.mutex.Unlock()
+	sink.flushes++
+	return nil
+}
+
+func (sink *captureSink) Close() error {
+	sink.mutex.Lock()
+	defer sink.mutex.Unlock()
+	sink.closes++
+	return nil
+}
+
+func (sink *captureSink) snapshot() []Event {
+	sink.mutex.Lock()
+	defer sink.mutex.Unlock()
+	return append([]Event(nil), sink.events...)
+}
+
+func (sink *captureSink) counts() (batches, flushes, closes int) {
+	sink.mutex.Lock()
+	defer sink.mutex.Unlock()
+	return sink.batches, sink.flushes, sink.closes
+}
+
+// gateSink stalls the writer: WriteBatch blocks until release. Tests use
+// it to fill the buffer deterministically (drop/blocking-policy tests) or
+// to hold the writer hostage (ctx-bounded Close).
+type gateSink struct {
+	captureSink
+	gate        chan struct{}
+	releaseOnce sync.Once
+}
+
+func newGateSink() *gateSink {
+	return &gateSink{gate: make(chan struct{})}
+}
+
+func (sink *gateSink) release() {
+	sink.releaseOnce.Do(func() { close(sink.gate) })
+}
+
+func (sink *gateSink) WriteBatch(batch Batch) error {
+	<-sink.gate
+	return sink.captureSink.WriteBatch(batch)
+}
+
+// newCaptureTracer builds a tracer over a capture sink and guarantees the
+// writer is shut down by test end (Close is idempotent, so tests that
+// Close explicitly are unaffected).
+func newCaptureTracer(t *testing.T, opts ...Option) (*Tracer, *captureSink) {
 	t.Helper()
-	tracer, err := New(nopSink{}, opts...)
+	capture := &captureSink{}
+	tracer, err := New(capture, opts...)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	return tracer
+	t.Cleanup(func() { _ = tracer.Close(context.Background()) })
+	return tracer, capture
 }
 
-// nextEvent pops the oldest buffered event. All sends in these tests
-// happen-before the read, so an empty buffer is a hard failure, not a race.
-func nextEvent(t *testing.T, tracer *Tracer) Event {
+func mustClose(t *testing.T, tracer *Tracer) {
 	t.Helper()
-	select {
-	case e := <-tracer.events:
-		return e
-	default:
-		t.Fatal("expected a buffered event, buffer is empty")
-		return Event{}
+	if err := tracer.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
 	}
+}
+
+func eventsOfKind(events []Event, kind EventKind) []Event {
+	var matched []Event
+	for _, event := range events {
+		if event.Kind == kind {
+			matched = append(matched, event)
+		}
+	}
+	return matched
 }
 
 func TestNewValidation(t *testing.T) {
 	if _, err := New(nil); err == nil {
 		t.Error("New(nil) should error")
 	}
-	if _, err := New(nopSink{}, WithBufferSize(0)); err == nil {
+	if _, err := New(&captureSink{}, WithBufferSize(0)); err == nil {
 		t.Error("WithBufferSize(0) should error")
 	}
-	if _, err := New(nopSink{}, WithFlushInterval(-time.Second)); err == nil {
+	if _, err := New(&captureSink{}, WithFlushInterval(-time.Second)); err == nil {
 		t.Error("WithFlushInterval(-1s) should error")
 	}
-	if _, err := New(nopSink{}, WithBufferSize(16), WithFlushInterval(time.Millisecond)); err != nil {
+	tracer, err := New(&captureSink{}, WithBufferSize(16), WithFlushInterval(time.Millisecond))
+	if err != nil {
 		t.Errorf("valid options should not error: %v", err)
 	}
+	mustClose(t, tracer)
 }
 
 func TestNilTracerIsOff(t *testing.T) {
@@ -67,6 +143,15 @@ func TestNilTracerIsOff(t *testing.T) {
 	span.SetAttrs(slog.Int("n", 1))
 	span.Fail(context.Canceled)
 	span.End()
+
+	if closer := tracer.Track(ctx, "leaf"); closer == nil {
+		t.Error("nil-tracer Track must still return a callable closer")
+	} else {
+		closer()
+	}
+	if err := tracer.Close(ctx); err != nil {
+		t.Errorf("nil-tracer Close must be a no-op, got %v", err)
+	}
 }
 
 func TestFromContext(t *testing.T) {
@@ -77,7 +162,7 @@ func TestFromContext(t *testing.T) {
 		t.Error("FromContext(nil) must return nil")
 	}
 
-	tracer := newTestTracer(t)
+	tracer, _ := newCaptureTracer(t)
 	ctx, span := tracer.Start(context.Background(), "work")
 	if FromContext(ctx) != span {
 		t.Error("FromContext must return the span Start put in the context")
@@ -85,40 +170,49 @@ func TestFromContext(t *testing.T) {
 }
 
 func TestStartMintsRoot(t *testing.T) {
-	tracer := newTestTracer(t)
+	tracer, capture := newCaptureTracer(t)
 	_, span := tracer.Start(context.Background(), "root", slog.String("path", "/a"))
+	mustClose(t, tracer)
 
-	event := nextEvent(t, tracer)
-	if event.Kind != EventStart {
-		t.Fatalf("Kind = %v, want EventStart", event.Kind)
+	events := capture.snapshot()
+	if len(events) != 1 {
+		t.Fatalf("captured %d events, want 1", len(events))
 	}
-	if event.SpanID == 0 || span.id != event.SpanID {
-		t.Errorf("SpanID = %d, span.id = %d; want equal and nonzero", event.SpanID, span.id)
+	start := events[0]
+	if start.Kind != EventStart {
+		t.Fatalf("Kind = %v, want EventStart", start.Kind)
 	}
-	if event.TraceID != event.SpanID {
-		t.Errorf("root TraceID = %d, want its own SpanID %d", event.TraceID, event.SpanID)
+	if start.SpanID == 0 || span.id != start.SpanID {
+		t.Errorf("SpanID = %d, span.id = %d; want equal and nonzero", start.SpanID, span.id)
 	}
-	if event.ParentID != 0 {
-		t.Errorf("root ParentID = %d, want 0", event.ParentID)
+	if start.TraceID != start.SpanID {
+		t.Errorf("root TraceID = %d, want its own SpanID %d", start.TraceID, start.SpanID)
 	}
-	if event.Name != "root" {
-		t.Errorf("Name = %q, want %q", event.Name, "root")
+	if start.ParentID != 0 {
+		t.Errorf("root ParentID = %d, want 0", start.ParentID)
 	}
-	if event.StartNS <= 0 {
-		t.Errorf("StartNS = %d, want positive", event.StartNS)
+	if start.Name != "root" {
+		t.Errorf("Name = %q, want %q", start.Name, "root")
 	}
-	if len(event.Attrs) != 1 || event.Attrs[0].Key != "path" {
-		t.Errorf("Attrs = %v, want the one passed to Start", event.Attrs)
+	if start.StartNS <= 0 {
+		t.Errorf("StartNS = %d, want positive", start.StartNS)
+	}
+	if len(start.Attrs) != 1 || start.Attrs[0].Key != "path" {
+		t.Errorf("Attrs = %v, want the one passed to Start", start.Attrs)
 	}
 }
 
 func TestStartNestsViaContext(t *testing.T) {
-	tracer := newTestTracer(t)
+	tracer, capture := newCaptureTracer(t)
 	rootCtx, root := tracer.Start(context.Background(), "root")
 	childCtx, child := tracer.Start(rootCtx, "child")
+	mustClose(t, tracer)
 
-	rootEvent := nextEvent(t, tracer)
-	childEvent := nextEvent(t, tracer)
+	events := capture.snapshot()
+	if len(events) != 2 {
+		t.Fatalf("captured %d events, want 2", len(events))
+	}
+	rootEvent, childEvent := events[0], events[1]
 	if childEvent.ParentID != rootEvent.SpanID {
 		t.Errorf("child ParentID = %d, want root's SpanID %d", childEvent.ParentID, rootEvent.SpanID)
 	}
@@ -134,7 +228,7 @@ func TestStartNestsViaContext(t *testing.T) {
 }
 
 func TestStartWithNilContext(t *testing.T) {
-	tracer := newTestTracer(t)
+	tracer, _ := newCaptureTracer(t)
 	ctx, span := tracer.Start(nil, "work") //nolint:staticcheck // nil-safety is the contract under test
 	if ctx == nil {
 		t.Fatal("Start(nil, ...) must return a usable context")
@@ -145,67 +239,101 @@ func TestStartWithNilContext(t *testing.T) {
 }
 
 func TestDropPolicyCountsDrops(t *testing.T) {
-	tracer := newTestTracer(t, WithBufferSize(2))
-	for i := 0; i < 5; i++ {
+	synctest.Test(t, func(t *testing.T) {
+		sink := newGateSink()
+		tracer, err := New(sink, WithBufferSize(2))
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		t.Cleanup(func() { _ = tracer.Close(context.Background()) })
+		t.Cleanup(sink.release) // LIFO: gate opens before Close drains
+
+		// First event: the writer picks it up and is now stuck inside
+		// WriteBatch on the gate; after Wait the buffer is empty again.
 		tracer.Start(context.Background(), "work")
-	}
-	if got := tracer.dropped.Load(); got != 3 {
-		t.Errorf("dropped = %d, want 3 (5 events into a buffer of 2)", got)
-	}
+		synctest.Wait()
+
+		// Two fill the buffer, three overflow.
+		for i := 0; i < 5; i++ {
+			tracer.Start(context.Background(), "work")
+		}
+		if got := tracer.dropped.Load(); got != 3 {
+			t.Errorf("dropped = %d, want 3 (5 events into a stalled buffer of 2)", got)
+		}
+	})
 }
 
 func TestBlockingPolicyBlocksUntilDrained(t *testing.T) {
-	tracer := newTestTracer(t, WithBufferSize(1), WithBlockingPolicy())
-	tracer.Start(context.Background(), "fills-the-buffer")
+	synctest.Test(t, func(t *testing.T) {
+		sink := newGateSink()
+		tracer, err := New(sink, WithBufferSize(1), WithBlockingPolicy())
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		t.Cleanup(func() { _ = tracer.Close(context.Background()) })
+		t.Cleanup(sink.release)
 
-	unblocked := make(chan struct{})
-	go func() {
-		tracer.Start(context.Background(), "blocks")
-		close(unblocked)
-	}()
+		tracer.Start(context.Background(), "writer-takes-this")
+		synctest.Wait() // writer now stuck in the gate; buffer empty
+		tracer.Start(context.Background(), "fills-the-buffer")
 
-	select {
-	case <-unblocked:
-		t.Fatal("send into a full buffer must block under WithBlockingPolicy")
-	case <-time.After(50 * time.Millisecond):
-	}
+		var unblocked bool
+		go func() {
+			tracer.Start(context.Background(), "blocks")
+			unblocked = true
+		}()
+		synctest.Wait()
+		if unblocked {
+			t.Fatal("send into a full buffer must block under WithBlockingPolicy")
+		}
 
-	<-tracer.events // make room
-	select {
-	case <-unblocked:
-	case <-time.After(2 * time.Second):
-		t.Fatal("blocked producer must resume once the buffer drains")
-	}
+		sink.release()
+		synctest.Wait()
+		if !unblocked {
+			t.Fatal("blocked producer must resume once the buffer drains")
+		}
+	})
 }
 
-func TestStopUnblocksBlockedProducer(t *testing.T) {
-	tracer := newTestTracer(t, WithBufferSize(1), WithBlockingPolicy())
-	tracer.Start(context.Background(), "fills-the-buffer")
+func TestCloseUnblocksBlockedProducer(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		sink := newGateSink()
+		tracer, err := New(sink, WithBufferSize(1), WithBlockingPolicy())
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		t.Cleanup(func() { _ = tracer.Close(context.Background()) })
+		t.Cleanup(sink.release)
 
-	unblocked := make(chan struct{})
-	go func() {
-		tracer.Start(context.Background(), "blocks")
-		close(unblocked)
-	}()
-	time.Sleep(50 * time.Millisecond) // let it reach the blocking select
+		tracer.Start(context.Background(), "writer-takes-this")
+		synctest.Wait()
+		tracer.Start(context.Background(), "fills-the-buffer")
 
-	close(tracer.stop)
-	select {
-	case <-unblocked:
-	case <-time.After(2 * time.Second):
-		t.Fatal("closing stop must unblock a blocked producer")
-	}
+		var unblocked bool
+		go func() {
+			tracer.Start(context.Background(), "blocks")
+			unblocked = true
+		}()
+		synctest.Wait()
+
+		// Close flips closed and shuts stop; the producer must fall
+		// through even though the writer is still hostage to the gate.
+		go func() { _ = tracer.Close(context.Background()) }()
+		synctest.Wait()
+		if !unblocked {
+			t.Fatal("Close must unblock a producer stuck on a full buffer")
+		}
+	})
 }
 
 func TestSendAfterCloseIsInert(t *testing.T) {
-	tracer := newTestTracer(t)
-	tracer.closed.Store(true)
+	tracer, capture := newCaptureTracer(t)
+	tracer.Start(context.Background(), "before")
+	mustClose(t, tracer)
 
-	tracer.Start(context.Background(), "work")
-	select {
-	case e := <-tracer.events:
-		t.Errorf("closed tracer must not enqueue events, got %+v", e)
-	default:
+	tracer.Start(context.Background(), "after")
+	if events := capture.snapshot(); len(events) != 1 || events[0].Name != "before" {
+		t.Errorf("closed tracer must emit nothing, captured %v", events)
 	}
 	if got := tracer.dropped.Load(); got != 0 {
 		t.Errorf("inert no-ops must not count as drops, dropped = %d", got)
@@ -213,32 +341,31 @@ func TestSendAfterCloseIsInert(t *testing.T) {
 }
 
 func TestTrackIsLeafOnly(t *testing.T) {
-	tracer := newTestTracer(t)
+	tracer, capture := newCaptureTracer(t)
 	rootCtx, root := tracer.Start(context.Background(), "root")
-	nextEvent(t, tracer)
 
 	stop := tracer.Track(rootCtx, "leaf", slog.String("tool", "ffmpeg"))
-	trackStart := nextEvent(t, tracer)
-	if trackStart.ParentID != root.id {
-		t.Errorf("Track span ParentID = %d, want the ctx span %d", trackStart.ParentID, root.id)
-	}
-
 	// Track returned no context, so a sibling started from the same ctx
 	// nests under root, never under the tracked leaf.
-	_, sibling := tracer.Start(rootCtx, "sibling")
-	siblingStart := nextEvent(t, tracer)
+	_, _ = tracer.Start(rootCtx, "sibling")
+	stop()
+	mustClose(t, tracer)
+
+	events := capture.snapshot()
+	starts := eventsOfKind(events, EventStart)
+	if len(starts) != 3 {
+		t.Fatalf("captured %d start events, want 3", len(starts))
+	}
+	leafStart, siblingStart := starts[1], starts[2]
+	if leafStart.ParentID != root.id {
+		t.Errorf("Track span ParentID = %d, want the ctx span %d", leafStart.ParentID, root.id)
+	}
 	if siblingStart.ParentID != root.id {
 		t.Errorf("sibling ParentID = %d, want root %d — nothing may nest under a Track span", siblingStart.ParentID, root.id)
 	}
-	_ = sibling
-
-	stop()
-	trackEnd := nextEvent(t, tracer)
-	if trackEnd.Kind != EventEnd || trackEnd.SpanID != trackStart.SpanID {
-		t.Errorf("Track's closer must end the tracked span, got %+v", trackEnd)
-	}
-	if trackEnd.EndNS < trackStart.StartNS {
-		t.Error("Track span must span evaluation to closer call")
+	ends := eventsOfKind(events, EventEnd)
+	if len(ends) != 1 || ends[0].SpanID != leafStart.SpanID {
+		t.Errorf("Track's closer must end exactly the tracked span, got %v", ends)
 	}
 }
 
@@ -256,7 +383,7 @@ func TestDefaultTracerMirrors(t *testing.T) {
 	}
 	Track(ctx, "leaf")() // must not panic
 
-	tracer := newTestTracer(t)
+	tracer, capture := newCaptureTracer(t)
 	SetDefault(tracer)
 	if Default() != tracer {
 		t.Fatal("Default() must return the tracer just set")
@@ -265,17 +392,17 @@ func TestDefaultTracerMirrors(t *testing.T) {
 	if span == nil {
 		t.Error("package Start must mint spans on the default tracer")
 	}
-	if got := nextEvent(t, tracer); got.Kind != EventStart {
-		t.Errorf("package Start must emit on the default tracer, got %+v", got)
-	}
 	Track(ctx, "leaf")()
-	if got := nextEvent(t, tracer); got.Kind != EventStart || got.Name != "leaf" {
-		t.Errorf("package Track must emit on the default tracer, got %+v", got)
+	mustClose(t, tracer)
+
+	starts := eventsOfKind(capture.snapshot(), EventStart)
+	if len(starts) != 2 || starts[0].Name != "work" || starts[1].Name != "leaf" {
+		t.Errorf("package mirrors must emit on the default tracer, got %v", starts)
 	}
 }
 
 func TestTimestampsAreMonotonic(t *testing.T) {
-	tracer := newTestTracer(t)
+	tracer, _ := newCaptureTracer(t)
 	first := tracer.now()
 	second := tracer.now()
 	if second < first {

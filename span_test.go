@@ -9,22 +9,28 @@ import (
 	"testing"
 )
 
-// startDrained starts a span and discards its start event, leaving the
-// buffer empty for the assertion under test.
-func startDrained(t *testing.T, tracer *Tracer, name string) *Span {
+// onlyEnd closes the tracer and returns the single end event it delivered.
+func onlyEnd(t *testing.T, tracer *Tracer, capture *captureSink) Event {
 	t.Helper()
-	_, span := tracer.Start(context.Background(), name)
-	nextEvent(t, tracer)
-	return span
+	mustClose(t, tracer)
+	ends := eventsOfKind(capture.snapshot(), EventEnd)
+	if len(ends) != 1 {
+		t.Fatalf("captured %d end events, want exactly 1", len(ends))
+	}
+	return ends[0]
 }
 
 func TestEndEmitsCompleteEvent(t *testing.T) {
-	tracer := newTestTracer(t)
+	tracer, capture := newCaptureTracer(t)
 	_, span := tracer.Start(context.Background(), "work")
-	start := nextEvent(t, tracer)
-
 	span.End()
-	end := nextEvent(t, tracer)
+	mustClose(t, tracer)
+
+	events := capture.snapshot()
+	if len(events) != 2 {
+		t.Fatalf("captured %d events, want start+end", len(events))
+	}
+	start, end := events[0], events[1]
 	if end.Kind != EventEnd {
 		t.Fatalf("Kind = %v, want EventEnd", end.Kind)
 	}
@@ -56,12 +62,12 @@ func TestFailClassification(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			tracer := newTestTracer(t)
-			span := startDrained(t, tracer, "work")
+			tracer, capture := newCaptureTracer(t)
+			_, span := tracer.Start(context.Background(), "work")
 			span.Fail(tc.err)
 			span.End()
 
-			end := nextEvent(t, tracer)
+			end := onlyEnd(t, tracer, capture)
 			if end.Status != tc.wantStatus {
 				t.Errorf("Status = %v, want %v", end.Status, tc.wantStatus)
 			}
@@ -73,72 +79,70 @@ func TestFailClassification(t *testing.T) {
 }
 
 func TestFailNilIsNoOp(t *testing.T) {
-	tracer := newTestTracer(t)
-	span := startDrained(t, tracer, "work")
+	tracer, capture := newCaptureTracer(t)
+	_, span := tracer.Start(context.Background(), "work")
 	span.Fail(nil)
 	span.End()
-	if end := nextEvent(t, tracer); end.Status != SpanStatusOK {
+	if end := onlyEnd(t, tracer, capture); end.Status != SpanStatusOK {
 		t.Errorf("Fail(nil) must not change status, got %v", end.Status)
 	}
 }
 
 func TestLastFailWins(t *testing.T) {
-	tracer := newTestTracer(t)
-	span := startDrained(t, tracer, "work")
+	tracer, capture := newCaptureTracer(t)
+	_, span := tracer.Start(context.Background(), "work")
 	span.Fail(errors.New("first"))
 	span.Fail(errors.New("second"))
 	span.End()
-	if end := nextEvent(t, tracer); end.Error != "second" {
+	if end := onlyEnd(t, tracer, capture); end.Error != "second" {
 		t.Errorf("Error = %q, want the last Fail's message", end.Error)
 	}
 }
 
 func TestFirstEndWins(t *testing.T) {
-	tracer := newTestTracer(t)
-	span := startDrained(t, tracer, "work")
+	tracer, capture := newCaptureTracer(t)
+	_, span := tracer.Start(context.Background(), "work")
 	span.End()
 	span.End()
 	span.Fail(errors.New("too late"))
 	span.SetAttrs(slog.String("k", "v"))
+	mustClose(t, tracer)
 
-	end := nextEvent(t, tracer)
-	if end.Status != SpanStatusOK || end.Error != "" {
+	events := capture.snapshot()
+	ends := eventsOfKind(events, EventEnd)
+	if len(ends) != 1 {
+		t.Fatalf("captured %d end events, want exactly 1 (first End wins)", len(ends))
+	}
+	if ends[0].Status != SpanStatusOK || ends[0].Error != "" {
 		t.Error("mutations after End must not alter the emitted event")
 	}
-	select {
-	case e := <-tracer.events:
-		t.Errorf("mutations after End must emit nothing, got %+v", e)
-	default:
+	if attrs := eventsOfKind(events, EventAttrs); len(attrs) != 0 {
+		t.Errorf("SetAttrs after End must emit nothing, got %v", attrs)
 	}
 }
 
 func TestSetAttrsEmitsDelta(t *testing.T) {
-	tracer := newTestTracer(t)
-	span := startDrained(t, tracer, "work")
+	tracer, capture := newCaptureTracer(t)
+	_, span := tracer.Start(context.Background(), "work")
 	span.SetAttrs(slog.Int("rows", 42), slog.String("stage", "hash"))
+	span.SetAttrs() // empty call emits nothing
+	mustClose(t, tracer)
 
-	event := nextEvent(t, tracer)
-	if event.Kind != EventAttrs {
-		t.Fatalf("Kind = %v, want EventAttrs", event.Kind)
+	attrEvents := eventsOfKind(capture.snapshot(), EventAttrs)
+	if len(attrEvents) != 1 {
+		t.Fatalf("captured %d attrs events, want exactly 1", len(attrEvents))
 	}
-	if event.SpanID != span.id {
+	if attrEvents[0].SpanID != span.id {
 		t.Error("attrs event must identify its span")
 	}
-	if len(event.Attrs) != 2 {
-		t.Errorf("Attrs length = %d, want 2", len(event.Attrs))
-	}
-
-	span.SetAttrs() // empty call emits nothing
-	select {
-	case e := <-tracer.events:
-		t.Errorf("SetAttrs() with no attrs must emit nothing, got %+v", e)
-	default:
+	if len(attrEvents[0].Attrs) != 2 {
+		t.Errorf("Attrs length = %d, want 2", len(attrEvents[0].Attrs))
 	}
 }
 
 func TestCrossGoroutineMutationsAreSafe(t *testing.T) {
-	tracer := newTestTracer(t, WithBufferSize(1024))
-	span := startDrained(t, tracer, "work")
+	tracer, capture := newCaptureTracer(t, WithBufferSize(1024))
+	_, span := tracer.Start(context.Background(), "work")
 
 	var waitGroup sync.WaitGroup
 	for i := 0; i < 16; i++ {
@@ -148,19 +152,9 @@ func TestCrossGoroutineMutationsAreSafe(t *testing.T) {
 		go func() { defer waitGroup.Done(); span.End() }()
 	}
 	waitGroup.Wait()
+	mustClose(t, tracer)
 
-	ends := 0
-	for {
-		select {
-		case e := <-tracer.events:
-			if e.Kind == EventEnd {
-				ends++
-			}
-		default:
-			if ends != 1 {
-				t.Errorf("got %d end events, want exactly 1 (first End wins)", ends)
-			}
-			return
-		}
+	if ends := eventsOfKind(capture.snapshot(), EventEnd); len(ends) != 1 {
+		t.Errorf("got %d end events, want exactly 1 (first End wins)", len(ends))
 	}
 }

@@ -49,8 +49,10 @@ type Batch struct {
 // WriteBatch delivers events as the tracer's queue drains — under light
 // load a batch of one is a stream. Flush ticks on the tracer's flush
 // interval and is the commit/fsync moment; a sink that writes immediately
-// may no-op it. Close is called exactly once, by Tracer.Close, after a
-// final WriteBatch and Flush; nothing is delivered afterward.
+// may no-op it. Close is called exactly once — from the writer goroutine,
+// as Tracer.Close's final act after the drain and last Flush — so the
+// sink's entire post-construction lifecycle stays on one goroutine;
+// nothing is delivered afterward.
 //
 // Sinks must not retain the Batch or anything reachable from it (including
 // Attrs slices) after the call returns: the writer reuses buffers, and
