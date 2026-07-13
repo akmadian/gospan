@@ -30,11 +30,14 @@ viewed locally, queried with SQL.
 
 ```go
 func main() {
-    // Pick a destination: the SQLite file (one auto-named file per run)...
-    t, err := gospan.New(sqlite.New("./traces"))
-    // ...or your existing log flow, no file at all (any logger with a
-    // slog.Handler bridge): gospan.New(gospan.SlogSink(logger))
-    if err != nil { /* the only error you'll ever see from us */ }
+    // Pick a destination: the SQLite file (one auto-named file per run) —
+    // or your existing log flow, no file at all (any logger with a
+    // slog.Handler bridge): sink := gospan.SlogSink(logger)
+    sink, err := sqlite.New("./traces")
+    if err != nil { /* construction is the only moment gospan can fail */ }
+
+    t, err := gospan.New(sink)
+    if err != nil { /* ...same deal */ }
     defer t.Close(context.Background())
     gospan.SetDefault(t)
     // ...

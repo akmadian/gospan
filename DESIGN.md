@@ -108,8 +108,9 @@ Start/End/SetAttrs ──► bounded channel ──► writer goroutine ──�
   counted (`Stats`) and optionally logged (`WithLogger`), never propagated.
 - The writer goroutine runs its own recover loop — a bad batch degrades to
   "dropped a batch," not a crashed process.
-- Disk full / DB errors degrade to drop-and-count. The only error a caller
-  ever sees is from `New` — the one moment a human can fix a bad path.
+- Disk full / DB errors degrade to drop-and-count. The only errors a caller
+  ever sees are at construction (`gospan.New`, sink constructors like
+  `sqlite.New`) — the one moment a human can fix a bad path.
 - `nil` is off: all methods on nil receivers are no-ops, so "tracing disabled"
   is "don't construct one." No flags, no build tags.
 - Shutdown: `Close` drains and finishes the file (zero loss). SIGKILL/power
@@ -222,8 +223,8 @@ live run by polling a `serve` snapshot URL. What it renders:
 
 **Live-ish mode** comes from `serve` (in the `gospan/sqlite` module — it's
 meaningless without a database file): an HTTP handler exposing a consistent
-snapshot of the live DB at `/trace.db` (SQLite's backup API — you can't serve
-a WAL file's bytes mid-write). Refresh = current state within one flush
+snapshot of the live DB at `/trace.db` (`VACUUM INTO` — you can't serve a
+WAL file's bytes mid-write). Refresh = current state within one flush
 interval. True streaming is deliberately out (see DEFERRED.md);
 snapshot-on-refresh costs nothing when no client asks and changes no core
 design.

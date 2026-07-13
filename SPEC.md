@@ -10,9 +10,10 @@ files outlive library versions).
 ```go
 package gospan
 
-// Construction — the one place errors surface. New mirrors slog.New: hand
-// it a Sink (the destination); the Tracer owns everything upstream of it.
-// After New succeeds, nothing gospan does ever returns an error or panics
+// Construction — errors surface at construction and nowhere else (here, and
+// in sink constructors like sqlite.New). New mirrors slog.New: hand it a
+// Sink (the destination); the Tracer owns everything upstream of it. After
+// construction succeeds, nothing gospan does ever returns an error or panics
 // into the caller.
 func New(s Sink, opts ...Option) (*Tracer, error)
 func SetDefault(t *Tracer)
@@ -105,13 +106,14 @@ One repo, two Go modules, one external viewer repo:
 - **`gospan` (core module): zero third-party dependencies — stdlib only.**
   Tracer, Span, Sink, SlogSink, Stats, Summary.
 - **`gospan/sqlite` (nested module, own go.mod):** the flagship sink —
-  `sqlite.New(dir string) Sink` creates the directory if absent and mints one
+  `sqlite.New(dir string) (Sink, error)` creates the directory if absent
+  (construction is where its errors surface) and mints one
   auto-named file per run (`gospan-<utc-timestamp>-<pid>.sqlite`; no
   collision semantics exist because no two runs share a file; multi-run
   analysis is ATTACH across siblings; the sink exposes `Path()`). Carries
   `modernc.org/sqlite`; users who don't import this module never see it, not
   even in go.sum. Also home to **`serve`**: an `http.Handler` exposing a
-  consistent snapshot of the live DB at `/trace.db` (SQLite backup API;
+  consistent snapshot of the live DB at `/trace.db` (`VACUUM INTO`;
   snapshots made on request, cached briefly, zero cost when no client asks).
 - **The viewer is a separate repository** (producer and consumer have
   different lifecycles and toolchains). It consumes §3–§5 of this spec as a

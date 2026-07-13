@@ -208,3 +208,29 @@ goroutines by design; a slow sink backpressures visibly via
 never starves the rest. Forced a contract clarification worth having anyway:
 sinks must not retain the delivered `Batch` — the writer reuses buffers, and
 under fan-out the same batch visits every sink.
+
+## 2026-07-13 — Implementation round
+
+**D23 — `sqlite.New(dir string) (Sink, error)`; errors surface at
+construction, wherever construction happens.** The founding spec pinned
+`sqlite.New(dir) Sink` with `gospan.New` as "the one place errors surface" —
+but sink construction can genuinely fail (bad directory, unwritable disk,
+DDL failure), and that error had nowhere idiomatic to go. Rejected: a
+Flush-probe in `gospan.New` (a failed sink stores its error and returns it
+from every method; New probes once before starting the writer — zero new API,
+but overloads Flush's semantics and hides the failure contract) and an
+optional `interface{ Err() error }` (a side contract sink authors must
+discover). Chosen: plain Go idiom — the constructor returns the error. The
+principle survives restated: errors surface at construction time, never
+during operation; there are simply two constructors now. Costs the README
+quickstart its one-line nesting.
+
+**D24 — `serve` snapshots via `VACUUM INTO`, not the backup API.** The
+founding docs parenthetically named SQLite's backup API as the snapshot
+mechanism. `VACUUM INTO` provides the identical observable guarantee — a
+consistent point-in-time copy of a live WAL database — as one SQL statement
+through plain database/sql, where modernc's backup API requires
+raw-connection plumbing into driver internals. Trade accepted: each snapshot
+is a full compacting rewrite rather than a page-level copy — mitigated by
+the snapshot cache and by snapshots being made only on request; the copy
+arrives defragmented as a side effect.
