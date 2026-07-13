@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -37,7 +38,7 @@ const (
 type config struct {
 	bufferSize              int
 	flushInterval           time.Duration
-	blocking                bool
+	blockOnQueueFull        bool
 	logger                  *slog.Logger
 	overheadSamplingCadence int
 }
@@ -61,7 +62,7 @@ func WithFlushInterval(duration time.Duration) Option {
 // WithBlockingPolicy makes producers block when the event buffer is full
 // instead of dropping. Close unblocks any blocked producer.
 func WithBlockingPolicy() Option {
-	return func(config *config) { config.blocking = true }
+	return func(config *config) { config.blockOnQueueFull = true }
 }
 
 // WithLogger gives the tracer a place to complain (rate-limited, Warn)
@@ -77,19 +78,19 @@ func WithLogger(l *slog.Logger) Option {
 // the ultimate accuracy in span-cost measurement, at the price of two
 // extra clock reads per span: the instrument taxing the pipeline it
 // measures. Raise it to cheapen tracing further on hot workloads.
-func WithOverheadSampling(every int) Option {
-	return func(config *config) { config.overheadSamplingCadence = every }
+func WithOverheadSampling(everyNSpans int) Option {
+	return func(config *config) { config.overheadSamplingCadence = everyNSpans }
 }
 
 // Tracer collects spans and delivers them to a Sink from a single writer
 // goroutine. Construct one with New; a nil *Tracer is a valid, permanently
 // inert tracer (every method is a no-op).
 type Tracer struct {
-	sink          Sink
-	flushInterval time.Duration
-	blocking      bool
-	logger        *slog.Logger
-	sampleEvery   uint64 // overhead-sampling cadence (1 = every span)
+	sink                    Sink
+	flushInterval           time.Duration
+	blockOnQueueFull        bool
+	logger                  *slog.Logger
+	overheadSamplingCadence uint64 // 1 = every span
 
 	// anchorTime is the (wall, monotonic) pair captured once at New; every
 	// timestamp is anchorTime + monotonic delta, so in-file durations are
@@ -117,6 +118,12 @@ type Tracer struct {
 	spansInFlight  atomic.Int64
 	tracesInFlight atomic.Int64
 	overheadNS     atomic.Int64 // EMA of sampled per-span tracer cost
+
+	// summaries holds the per-name aggregates behind Summary(). Owned by
+	// the writer goroutine; the mutex only mediates Summary() readers, so
+	// producers never contend on it.
+	summaryMutex sync.Mutex
+	summaries    map[string]*summaryAccumulator
 }
 
 // New constructs a Tracer that delivers spans to sink and starts its
@@ -148,15 +155,16 @@ func New(sink Sink, options ...Option) (*Tracer, error) {
 		return nil, fmt.Errorf("gospan: overhead sampling must be every 1st span or sparser, got %d", config.overheadSamplingCadence)
 	}
 	tracer := &Tracer{
-		sink:          sink,
-		flushInterval: config.flushInterval,
-		blocking:      config.blocking,
-		logger:        config.logger,
-		sampleEvery:   uint64(config.overheadSamplingCadence),
-		anchorTime:    time.Now(),
-		events:        make(chan Event, config.bufferSize),
-		stop:          make(chan struct{}),
-		done:          make(chan struct{}),
+		sink:                    sink,
+		flushInterval:           config.flushInterval,
+		blockOnQueueFull:        config.blockOnQueueFull,
+		logger:                  config.logger,
+		overheadSamplingCadence: uint64(config.overheadSamplingCadence),
+		anchorTime:              time.Now(),
+		events:                  make(chan Event, config.bufferSize),
+		stop:                    make(chan struct{}),
+		done:                    make(chan struct{}),
+		summaries:               make(map[string]*summaryAccumulator),
 	}
 	go tracer.run()
 	return tracer, nil
@@ -220,7 +228,7 @@ func (tracer *Tracer) Start(parent context.Context, name string, attrs ...slog.A
 	// The started counter doubles as the sampling clock: every Nth span
 	// (WithOverheadSampling, default 128) times its own Start+End tracer
 	// cost for Stats.OverheadPerSpan.
-	sampled := tracer.started.Add(1)%tracer.sampleEvery == 0
+	sampled := tracer.started.Add(1)%tracer.overheadSamplingCadence == 0
 	var sampleBegin time.Time
 	if sampled {
 		sampleBegin = time.Now()
@@ -325,7 +333,7 @@ func (tracer *Tracer) send(event Event) {
 	if tracer.closed.Load() {
 		return
 	}
-	if tracer.blocking {
+	if tracer.blockOnQueueFull {
 		// The stop channel is Close's escape hatch: a producer blocked on a
 		// full buffer must never outlive the tracer, so Close closes stop
 		// and every blocked send falls through (the event is lost, which

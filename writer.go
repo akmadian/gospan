@@ -34,6 +34,7 @@ func (tracer *Tracer) run() {
 			// under light load that's a batch of one reaching the sink
 			// near-instantly; under pressure the drain amortizes.
 			batch = tracer.drainInto(append(batch[:0], event))
+			tracer.recordCompletedSpans(batch)
 			tracer.writeBatch(batch)
 		case <-ticker.C:
 			tracer.flushSink()
@@ -47,6 +48,7 @@ func (tracer *Tracer) run() {
 				select {
 				case event := <-tracer.events:
 					batch = tracer.drainInto(append(batch[:0], event))
+					tracer.recordCompletedSpans(batch)
 					tracer.writeBatch(batch)
 				default:
 					tracer.flushSink()
