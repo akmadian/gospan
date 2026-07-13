@@ -84,7 +84,7 @@ func (tracer *Tracer) writeBatch(batch []Event) {
 		tracer.warn("gospan: sink WriteBatch failed", slog.Any("error", err))
 		return
 	}
-	tracer.written.Add(uint64(len(batch)))
+	tracer.written.Add(uint64(len(batch))) // a length is never negative
 }
 
 // flushSink ticks the sink's commit moment, with the same containment as

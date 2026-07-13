@@ -157,16 +157,18 @@ func (accumulator *summaryAccumulator) percentile(fraction float64) time.Duratio
 // sub-buckets — integer-only math (a bit-length and a shift), no logs or
 // floats on the writer path.
 func bucketIndexForDuration(durationNanos int64) int {
-	if durationNanos < 1 {
-		durationNanos = 1
+	if durationNanos < 8 {
+		if durationNanos < 1 {
+			durationNanos = 1
+		}
+		return int(durationNanos) - 1 // 1..7 → indexes 0..6, exact
 	}
-	value := uint64(durationNanos)
-	if value < 8 {
-		return int(value) - 1
-	}
-	octave := bits.Len64(value) - 1                // floor(log2(value)), ≥ 3 here
-	subBucket := (value >> (uint(octave) - 2)) & 3 // top two bits below the leader
-	return 7 + (octave-3)*4 + int(subBucket)
+	// durationNanos ≥ 8 past the branch above, so its unsigned view is
+	// identical and bits.Len64 reads the true magnitude.
+	value := uint64(durationNanos)                // positive by the guard above
+	octave := bits.Len64(value) - 1               // floor(log2(value)), 3..62 for any positive int64
+	subBucket := int((value >> (octave - 2)) & 3) // masked to 0..3 before converting
+	return 7 + (octave-3)*4 + subBucket
 }
 
 // durationForBucketIndex is the reverse mapping, reporting the bucket's
@@ -180,8 +182,9 @@ func durationForBucketIndex(index int) time.Duration {
 	octave := adjusted/4 + 3
 	subBucket := adjusted % 4
 	// int64 math throughout: octave tops out at 62, so the largest sum is
-	// 2^62 + 3·2^60 + 2^59 — comfortably below 2^63.
-	lowerBound := int64(1)<<uint(octave) + int64(subBucket)<<(uint(octave)-2)
-	bucketWidth := int64(1) << (uint(octave) - 2)
+	// 2^62 + 3·2^60 + 2^59 — comfortably below 2^63. Shift counts are
+	// plain ints; Go has accepted signed shift counts since 1.13.
+	lowerBound := int64(1)<<octave + int64(subBucket)<<(octave-2)
+	bucketWidth := int64(1) << (octave - 2)
 	return time.Duration(lowerBound + bucketWidth/2)
 }

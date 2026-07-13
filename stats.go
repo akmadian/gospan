@@ -49,8 +49,8 @@ func (tracer *Tracer) Stats() Stats {
 		Completed:       tracer.completed.Load(),
 		Written:         tracer.written.Load(),
 		Dropped:         tracer.dropped.Load(),
-		SpansInFlight:   int(tracer.spansInFlight.Load()),
-		TracesInFlight:  int(tracer.tracesInFlight.Load()),
+		SpansInFlight:   int(tracer.spansInFlight.Load()),  // counts concurrently-open spans, nowhere near 2^31
+		TracesInFlight:  int(tracer.tracesInFlight.Load()), // same bound
 		QueueDepth:      len(tracer.events),
 		WriteErrors:     tracer.writeErrors.Load(),
 		OverheadPerSpan: time.Duration(tracer.overheadNS.Load()),

@@ -159,7 +159,7 @@ func New(sink Sink, options ...Option) (*Tracer, error) {
 		flushInterval:           config.flushInterval,
 		blockOnQueueFull:        config.blockOnQueueFull,
 		logger:                  config.logger,
-		overheadSamplingCadence: uint64(config.overheadSamplingCadence),
+		overheadSamplingCadence: uint64(config.overheadSamplingCadence), // validated ≥ 1 above
 		anchorTime:              time.Now(),
 		events:                  make(chan Event, config.bufferSize),
 		stop:                    make(chan struct{}),
