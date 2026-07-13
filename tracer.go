@@ -257,8 +257,6 @@ func Track(ctx context.Context, name string, attrs ...slog.Attr) func() {
 // send enqueues an event for the writer. Full buffer: drop and count
 // (default) or block until there is room (WithBlockingPolicy); Close
 // unblocks blocked producers. After Close, send is a pure no-op.
-//
-//nolint:gocritic // hugeParam: by-value is deliberate — a pointer would make every event escape to the heap on the hot path; chunk-8 benchmarks hold this accountable
 func (tracer *Tracer) send(event Event) {
 	// Closed comes first and is a pure no-op, not a drop: Dropped measures
 	// buffer pressure on a live tracer, and counting post-Close sends would

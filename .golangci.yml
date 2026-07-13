@@ -81,6 +81,12 @@ linters:
       enabled-tags:
         - diagnostic
         - performance
+      settings:
+        # Event — the 112-byte domain type — deliberately travels by value:
+        # a pointer would make every event escape to the heap on the hot
+        # path, trading a stack copy for an allocation.
+        hugeParam:
+          sizeThreshold: 128
 
   exclusions:
     presets:
