@@ -15,8 +15,6 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/akmadian/gospan"
-
 	_ "modernc.org/sqlite" // the pure-Go driver: no CGO, no C compiler to adopt (D15)
 )
 
@@ -67,10 +65,16 @@ CREATE TABLE attrs (
 // Sink writes trace events into one SQLite file. Construct with New; it
 // implements gospan.Sink, buffering events in WriteBatch and committing
 // them in Flush — transaction batching is a SQLite strategy, not a writer
-// concern (D20).
+// concern (D20). All state below db/path is touched only by the tracer's
+// writer goroutine (the Sink contract), so none of it needs locking.
 type Sink struct {
 	db   *sql.DB
 	path string
+
+	pendingSpans []*spanRow
+	pendingByID  map[int64]*spanRow // open pending rows, for start+end coalescing
+	pendingAttrs []attrRow
+	nameIDs      map[string]int64 // interned span names
 }
 
 // New creates dir if absent, mints one auto-named trace file inside it
@@ -105,7 +109,12 @@ func New(dir string) (*Sink, error) {
 		removeErr := os.Remove(path)
 		return nil, fmt.Errorf("gospan/sqlite: initializing %s: %w", path, errors.Join(err, closeErr, removeErr))
 	}
-	return &Sink{db: db, path: path}, nil
+	return &Sink{
+		db:          db,
+		path:        path,
+		pendingByID: make(map[int64]*spanRow),
+		nameIDs:     make(map[string]int64),
+	}, nil
 }
 
 // initialize applies the pragmas, the schema, and the one-row meta table
@@ -145,18 +154,6 @@ func initialize(db *sql.DB) error {
 // Path reports where this run's trace file landed.
 func (sink *Sink) Path() string {
 	return sink.path
-}
-
-// WriteBatch buffers events for the next Flush. The write path lands in
-// the next change; until then events are accepted and dropped.
-func (sink *Sink) WriteBatch(gospan.Batch) error {
-	return nil
-}
-
-// Flush commits everything buffered since the last Flush — the durability
-// moment. The write path lands in the next change.
-func (sink *Sink) Flush() error {
-	return nil
 }
 
 // Close finishes the file. The tracer calls it exactly once, after a

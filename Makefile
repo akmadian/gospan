@@ -20,4 +20,7 @@ check-sqlite:
 	cd sqlite && $(GOLANGCI_LINT) run
 	cd sqlite && go test -race ./...
 
+testcache-clean:
+	go clean -testcache
+
 .PHONY: check check-core check-sqlite
