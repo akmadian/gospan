@@ -408,8 +408,11 @@ func TestTimestampsAreMonotonic(t *testing.T) {
 	if second < first {
 		t.Errorf("now() went backwards: %d then %d", first, second)
 	}
+	// The wall clock may tick coarser than the monotonic delta (darwin:
+	// microseconds vs nanoseconds), so now() can read slightly ahead of a
+	// later time.Now() — tolerate sub-millisecond skew in both directions.
 	wall := time.Now().UnixNano()
-	if diff := wall - second; diff < 0 || diff > int64(time.Minute) {
+	if diff := wall - second; diff < -int64(time.Millisecond) || diff > int64(time.Minute) {
 		t.Errorf("now() = %d is implausibly far from wall clock %d", second, wall)
 	}
 }

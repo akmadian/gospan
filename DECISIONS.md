@@ -234,3 +234,13 @@ raw-connection plumbing into driver internals. Trade accepted: each snapshot
 is a full compacting rewrite rather than a page-level copy — mitigated by
 the snapshot cache and by snapshots being made only on request; the copy
 arrives defragmented as a side effect.
+
+**D25 — Overhead sampling cadence is user-tunable
+(`WithOverheadSampling(every int)`, default 128).** The fixed 1-in-128
+sample kept the instrument from taxing the pipeline it measures, but it
+also capped accuracy: users diagnosing span cost itself want every=1 (every
+span timed — ultimate accuracy, two extra clock reads per span), and hot
+workloads may want sparser than 128. The default stays 128; the cadence
+check moves from a bitmask to a modulo (a nanosecond-scale cost, and the
+mask's power-of-two restriction would leak into the API). Requested by Ari
+during the chunk-6 review.

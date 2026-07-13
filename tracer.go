@@ -10,15 +10,36 @@ import (
 )
 
 const (
-	defaultBufferSize    = 8192
+	// defaultBufferSize is a burst absorber, not a backpressure queue. At
+	// 112 bytes per Event, 8192 is under 1 MB of flat, paid-once memory —
+	// and at two events per span it holds ~4096 spans' worth of burst,
+	// roughly 150ms of full-tilt production over one sink hiccup (a slow
+	// commit, a GC pause, a disk stall). It is deliberately not larger:
+	// sustained overload should surface as Dropped in Stats, not hide in
+	// memory — a 10× buffer wouldn't prevent that problem, it would report
+	// it 10× later.
+	defaultBufferSize = 8192
+
+	// defaultFlushInterval is the durability heartbeat, not delivery
+	// latency (events reach the sink as the queue drains). One second is
+	// where its three effects all stop mattering: a hard kill loses ≤1s of
+	// trace tail, a live snapshot reads as current to a human, and a
+	// buffering sink pays one transaction per second regardless of volume.
 	defaultFlushInterval = time.Second
+
+	// defaultOverheadSamplingCadence times every 128th span: measuring every
+	// Start/End pair costs two extra clock reads per span — the instrument
+	// taxing the pipeline it measures — and a 1-in-128 EMA converges plenty
+	// fast at tracing-worthy volumes. WithOverheadSampling tunes it.
+	defaultOverheadSamplingCadence = 128
 )
 
 type config struct {
-	bufferSize    int
-	flushInterval time.Duration
-	blocking      bool
-	logger        *slog.Logger
+	bufferSize              int
+	flushInterval           time.Duration
+	blocking                bool
+	logger                  *slog.Logger
+	overheadSamplingCadence int
 }
 
 // Option configures a Tracer at construction.
@@ -51,6 +72,15 @@ func WithLogger(l *slog.Logger) Option {
 	return func(config *config) { config.logger = l }
 }
 
+// WithOverheadSampling makes every Nth span time its own tracer cost for
+// Stats.OverheadPerSpan (default 128). every = 1 measures every span —
+// the ultimate accuracy in span-cost measurement, at the price of two
+// extra clock reads per span: the instrument taxing the pipeline it
+// measures. Raise it to cheapen tracing further on hot workloads.
+func WithOverheadSampling(every int) Option {
+	return func(config *config) { config.overheadSamplingCadence = every }
+}
+
 // Tracer collects spans and delivers them to a Sink from a single writer
 // goroutine. Construct one with New; a nil *Tracer is a valid, permanently
 // inert tracer (every method is a no-op).
@@ -59,6 +89,7 @@ type Tracer struct {
 	flushInterval time.Duration
 	blocking      bool
 	logger        *slog.Logger
+	sampleEvery   uint64 // overhead-sampling cadence (1 = every span)
 
 	// anchorTime is the (wall, monotonic) pair captured once at New; every
 	// timestamp is anchorTime + monotonic delta, so in-file durations are
@@ -78,6 +109,14 @@ type Tracer struct {
 	writeErrors atomic.Uint64
 	closed      atomic.Bool
 	lastWarn    atomic.Int64 // unix seconds of the last logger warning
+
+	// Stats counters and gauges (see Stats for meanings).
+	started        atomic.Uint64
+	completed      atomic.Uint64
+	written        atomic.Uint64
+	spansInFlight  atomic.Int64
+	tracesInFlight atomic.Int64
+	overheadNS     atomic.Int64 // EMA of sampled per-span tracer cost
 }
 
 // New constructs a Tracer that delivers spans to sink and starts its
@@ -89,8 +128,9 @@ func New(sink Sink, options ...Option) (*Tracer, error) {
 		return nil, errors.New("gospan: New called with nil Sink")
 	}
 	config := config{
-		bufferSize:    defaultBufferSize,
-		flushInterval: defaultFlushInterval,
+		bufferSize:              defaultBufferSize,
+		flushInterval:           defaultFlushInterval,
+		overheadSamplingCadence: defaultOverheadSamplingCadence,
 	}
 	for _, opt := range options {
 		opt(&config)
@@ -104,11 +144,15 @@ func New(sink Sink, options ...Option) (*Tracer, error) {
 	if config.flushInterval <= 0 {
 		return nil, fmt.Errorf("gospan: flush interval must be positive, got %v", config.flushInterval)
 	}
+	if config.overheadSamplingCadence < 1 {
+		return nil, fmt.Errorf("gospan: overhead sampling must be every 1st span or sparser, got %d", config.overheadSamplingCadence)
+	}
 	tracer := &Tracer{
 		sink:          sink,
 		flushInterval: config.flushInterval,
 		blocking:      config.blocking,
 		logger:        config.logger,
+		sampleEvery:   uint64(config.overheadSamplingCadence),
 		anchorTime:    time.Now(),
 		events:        make(chan Event, config.bufferSize),
 		stop:          make(chan struct{}),
@@ -173,6 +217,16 @@ func (tracer *Tracer) Start(parent context.Context, name string, attrs ...slog.A
 	}
 	defer tracer.guard()
 
+	// The started counter doubles as the sampling clock: every Nth span
+	// (WithOverheadSampling, default 128) times its own Start+End tracer
+	// cost for Stats.OverheadPerSpan.
+	sampled := tracer.started.Add(1)%tracer.sampleEvery == 0
+	var sampleBegin time.Time
+	if sampled {
+		sampleBegin = time.Now()
+	}
+	tracer.spansInFlight.Add(1)
+
 	// One atomic counter mints every ID. Monotonic int64s keep the SQLite
 	// B-tree append-only, and a child can name its parent while the parent
 	// is still sitting in the buffer — DB auto-increment could do neither
@@ -185,6 +239,7 @@ func (tracer *Tracer) Start(parent context.Context, name string, attrs ...slog.A
 		traceID = parentSpan.traceID
 	} else {
 		traceID = id
+		tracer.tracesInFlight.Add(1)
 	}
 	span = &Span{
 		tracer:  tracer,
@@ -193,6 +248,7 @@ func (tracer *Tracer) Start(parent context.Context, name string, attrs ...slog.A
 		parent:  parentID,
 		name:    name,
 		startNS: tracer.now(),
+		sampled: sampled,
 	}
 	// Emitted at occurrence, not held until End: a crashed run keeps every
 	// span that was open — usually the one you care most about — and a live
@@ -206,6 +262,11 @@ func (tracer *Tracer) Start(parent context.Context, name string, attrs ...slog.A
 		StartNS:  span.startNS,
 		Attrs:    attrs,
 	})
+	if sampled {
+		// Half the sample: End adds its own cost and folds the sum into
+		// the EMA, so OverheadPerSpan reports the full pair.
+		span.startCostNS = time.Since(sampleBegin).Nanoseconds()
+	}
 	if parent == nil {
 		parent = context.Background() // keep the nil-safety promise even for a nil ctx
 	}

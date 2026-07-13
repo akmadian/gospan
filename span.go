@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 )
 
 // SpanStatus classifies how a span ended — it never says whether it ended.
@@ -48,6 +49,11 @@ type Span struct {
 	parent  int64
 	name    string
 	startNS int64
+
+	// sampled marks the 1-in-128 spans that time their own tracer cost;
+	// startCostNS is Start's half, written once before the span is shared.
+	sampled     bool
+	startCostNS int64
 
 	mutex      sync.Mutex
 	ended      bool
@@ -122,6 +128,10 @@ func (span *Span) End() {
 		return
 	}
 	defer span.tracer.guard()
+	var sampleBegin time.Time
+	if span.sampled {
+		sampleBegin = time.Now()
+	}
 	// Flipping ended and sending the event happen under one mutex hold:
 	// every concurrent End/Fail/SetAttrs either fully precedes this event
 	// or observes ended and becomes a no-op. That single hold is what makes
@@ -132,6 +142,11 @@ func (span *Span) End() {
 		return
 	}
 	span.ended = true
+	span.tracer.completed.Add(1)
+	span.tracer.spansInFlight.Add(-1)
+	if span.parent == 0 {
+		span.tracer.tracesInFlight.Add(-1)
+	}
 	// The end event repeats Name and StartNS so a sink can still write a
 	// complete span when the start event was dropped under buffer pressure
 	// (the orphan-degradation rule, SPEC §2).
@@ -146,4 +161,9 @@ func (span *Span) End() {
 		Status:   span.status,
 		Error:    span.errMessage,
 	})
+	if span.sampled {
+		// The other half of the sample: Start's stored cost plus End's,
+		// folded into the rolling OverheadPerSpan average.
+		span.tracer.recordOverhead(span.startCostNS + time.Since(sampleBegin).Nanoseconds())
+	}
 }

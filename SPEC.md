@@ -24,6 +24,7 @@ func WithBufferSize(n int) Option              // bounded event buffer (default 
 func WithFlushInterval(d time.Duration) Option // Flush() tick cadence (default ~1s)
 func WithBlockingPolicy() Option               // block producers when full (default: drop and count)
 func WithLogger(l *slog.Logger) Option         // where the tracer complains (rate-limited, Warn); nil = silent
+func WithOverheadSampling(every int) Option    // every Nth span times its own cost (default 128; 1 = every span)
 
 // Spans. Start reads the parent span off ctx; no parent → new trace root.
 // The returned ctx carries the new span.

@@ -59,7 +59,10 @@ type Batch struct {
 // under MultiSink the same batch visits every sink. Copy what you keep.
 //
 // Returned errors never propagate to the traced program; the tracer counts
-// them (Stats.WriteErrors) and optionally logs them (WithLogger).
+// them (Stats.WriteErrors) and optionally logs them (WithLogger). A sink
+// that defers durability to Flush must report commit failures from Flush —
+// it is the only way a lost commit becomes visible in Stats, since the
+// tracer treats accepted batches as the sink's responsibility.
 type Sink interface {
 	WriteBatch(b Batch) error
 	Flush() error
