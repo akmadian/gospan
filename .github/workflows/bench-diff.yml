@@ -1,0 +1,49 @@
+# A/B benchmark diff on the PR's own runner: base and head measured on the
+# same machine, compared with benchstat. Report-only — p-values make real
+# regressions obvious; a hard ns/op gate on shared runners is how alerts
+# get ignored.
+name: bench-diff
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-diff-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  diff:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache-dependency-path: |
+            go.sum
+            sqlite/go.sum
+
+      # Raw go test rather than make bench: the base commit may predate
+      # the bench target, and the diff must not depend on the base Makefile.
+      - name: bench base
+        run: |
+          git checkout --detach ${{ github.event.pull_request.base.sha }}
+          go test -bench . -benchmem -count 10 -run '^$' ./... | tee /tmp/bench-base.txt
+          cd sqlite && go test -bench . -benchmem -count 10 -run '^$' ./... | tee -a /tmp/bench-base.txt
+      - name: bench head
+        run: |
+          git checkout --detach ${{ github.event.pull_request.head.sha }}
+          go test -bench . -benchmem -count 10 -run '^$' ./... | tee /tmp/bench-head.txt
+          cd sqlite && go test -bench . -benchmem -count 10 -run '^$' ./... | tee -a /tmp/bench-head.txt
+      - name: benchstat
+        run: |
+          {
+            echo '```'
+            go run golang.org/x/perf/cmd/benchstat@latest /tmp/bench-base.txt /tmp/bench-head.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

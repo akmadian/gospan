@@ -1,0 +1,42 @@
+# The gate: the same make check as local development, on every PR and
+# every push to main.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # A new push to a PR supersedes the running check; main runs to completion.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # The declared floor and the latest release: a library tests its
+        # minimum, not just tip.
+        go: ["1.25", "1.26"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache-dependency-path: |
+            go.sum
+            sqlite/go.sum
+
+      # gofmt, vet, the pinned linter, race tests, allocation ceilings, and
+      # govulncheck — for both modules.
+      - run: make check
+
+      # Benchmark smoke: every benchmark must still run; the numbers are
+      # informational (machine-dependent), the alloc gate in make check is
+      # the enforced half of the overhead posture.
+      - run: make bench BENCHTIME=100x
