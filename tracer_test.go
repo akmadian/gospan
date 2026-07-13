@@ -212,6 +212,68 @@ func TestSendAfterCloseIsInert(t *testing.T) {
 	}
 }
 
+func TestTrackIsLeafOnly(t *testing.T) {
+	tracer := newTestTracer(t)
+	rootCtx, root := tracer.Start(context.Background(), "root")
+	nextEvent(t, tracer)
+
+	stop := tracer.Track(rootCtx, "leaf", slog.String("tool", "ffmpeg"))
+	trackStart := nextEvent(t, tracer)
+	if trackStart.ParentID != root.id {
+		t.Errorf("Track span ParentID = %d, want the ctx span %d", trackStart.ParentID, root.id)
+	}
+
+	// Track returned no context, so a sibling started from the same ctx
+	// nests under root, never under the tracked leaf.
+	_, sibling := tracer.Start(rootCtx, "sibling")
+	siblingStart := nextEvent(t, tracer)
+	if siblingStart.ParentID != root.id {
+		t.Errorf("sibling ParentID = %d, want root %d — nothing may nest under a Track span", siblingStart.ParentID, root.id)
+	}
+	_ = sibling
+
+	stop()
+	trackEnd := nextEvent(t, tracer)
+	if trackEnd.Kind != EventEnd || trackEnd.SpanID != trackStart.SpanID {
+		t.Errorf("Track's closer must end the tracked span, got %+v", trackEnd)
+	}
+	if trackEnd.EndNS < trackStart.StartNS {
+		t.Error("Track span must span evaluation to closer call")
+	}
+}
+
+func TestDefaultTracerMirrors(t *testing.T) {
+	t.Cleanup(func() { SetDefault(nil) })
+
+	SetDefault(nil)
+	if Default() != nil {
+		t.Fatal("Default() must be nil until SetDefault")
+	}
+	ctx := context.Background()
+	returned, span := Start(ctx, "work")
+	if returned != ctx || span != nil {
+		t.Error("package Start without a default must be the nil-tracer no-op")
+	}
+	Track(ctx, "leaf")() // must not panic
+
+	tracer := newTestTracer(t)
+	SetDefault(tracer)
+	if Default() != tracer {
+		t.Fatal("Default() must return the tracer just set")
+	}
+	_, span = Start(ctx, "work")
+	if span == nil {
+		t.Error("package Start must mint spans on the default tracer")
+	}
+	if got := nextEvent(t, tracer); got.Kind != EventStart {
+		t.Errorf("package Start must emit on the default tracer, got %+v", got)
+	}
+	Track(ctx, "leaf")()
+	if got := nextEvent(t, tracer); got.Kind != EventStart || got.Name != "leaf" {
+		t.Errorf("package Track must emit on the default tracer, got %+v", got)
+	}
+}
+
 func TestTimestampsAreMonotonic(t *testing.T) {
 	tracer := newTestTracer(t)
 	first := tracer.now()

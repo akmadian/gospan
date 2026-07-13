@@ -62,6 +62,12 @@ func (span *Span) SetAttrs(attrs ...slog.Attr) {
 		return
 	}
 	defer span.tracer.guard()
+	// The ended check and the send happen under one mutex hold, the same
+	// mutex End takes: an attrs event can therefore never enter the queue
+	// after its span's end event — per-span event order stays strict, which
+	// sinks rely on. The attrs travel as a delta; merging last-wins is the
+	// destination's job (SQLite: primary-key replace; slog sink: its
+	// open-span map), so the hot path only appends.
 	span.mutex.Lock()
 	defer span.mutex.Unlock()
 	if span.ended {
@@ -84,6 +90,12 @@ func (span *Span) Fail(err error) {
 		return
 	}
 	defer span.tracer.guard()
+	// The caller usually can't tell a cancellation from a real failure at
+	// the call site — the classification is already inside the error value,
+	// so errors.Is reads it once, centrally (D4). Both errors.Is (walks
+	// caller-defined Unwrap chains) and Error() (arbitrary caller code) run
+	// before taking the lock: user code must never execute while a span's
+	// mutex is held.
 	status := SpanStatusError
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		status = SpanStatusCanceled
@@ -94,6 +106,9 @@ func (span *Span) Fail(err error) {
 	if span.ended {
 		return
 	}
+	// Stored, not emitted: "last Fail before End wins" resolves right here
+	// in the span, and End sends the final verdict once — no per-sink
+	// reconciliation, and a Fail with no End leaves no phantom event.
 	span.status = status
 	span.errMessage = message
 }
@@ -107,12 +122,19 @@ func (span *Span) End() {
 		return
 	}
 	defer span.tracer.guard()
+	// Flipping ended and sending the event happen under one mutex hold:
+	// every concurrent End/Fail/SetAttrs either fully precedes this event
+	// or observes ended and becomes a no-op. That single hold is what makes
+	// "first End wins" true and per-span event order strict.
 	span.mutex.Lock()
 	defer span.mutex.Unlock()
 	if span.ended {
 		return
 	}
 	span.ended = true
+	// The end event repeats Name and StartNS so a sink can still write a
+	// complete span when the start event was dropped under buffer pressure
+	// (the orphan-degradation rule, SPEC §2).
 	span.tracer.send(Event{
 		Kind:     EventEnd,
 		SpanID:   span.id,

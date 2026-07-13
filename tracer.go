@@ -88,6 +88,9 @@ func New(sink Sink, options ...Option) (*Tracer, error) {
 	for _, opt := range options {
 		opt(&config)
 	}
+	// Validation happens after all options apply, not inside each Option:
+	// New is the one place a caller handles errors, so bad values must
+	// surface here rather than panic inside an option closure.
 	if config.bufferSize <= 0 {
 		return nil, fmt.Errorf("gospan: buffer size must be positive, got %d", config.bufferSize)
 	}
@@ -135,13 +138,18 @@ func (tracer *Tracer) Start(parent context.Context, name string, attrs ...slog.A
 	}
 	defer tracer.guard()
 
+	// One atomic counter mints every ID. Monotonic int64s keep the SQLite
+	// B-tree append-only, and a child can name its parent while the parent
+	// is still sitting in the buffer — DB auto-increment could do neither
+	// (D2). A root reuses its own span ID as the trace ID, so trace
+	// identity costs no second counter.
 	id := tracer.ids.Add(1)
 	var parentID, traceID int64
 	if parentSpan := FromContext(parent); parentSpan != nil {
 		parentID = parentSpan.id
 		traceID = parentSpan.traceID
 	} else {
-		traceID = id // a root's trace ID is its own span ID
+		traceID = id
 	}
 	span = &Span{
 		tracer:  tracer,
@@ -151,6 +159,9 @@ func (tracer *Tracer) Start(parent context.Context, name string, attrs ...slog.A
 		name:    name,
 		startNS: tracer.now(),
 	}
+	// Emitted at occurrence, not held until End: a crashed run keeps every
+	// span that was open — usually the one you care most about — and a live
+	// snapshot always shows running work (D1).
 	tracer.send(Event{
 		Kind:     EventStart,
 		SpanID:   id,
@@ -166,22 +177,74 @@ func (tracer *Tracer) Start(parent context.Context, name string, attrs ...slog.A
 	return context.WithValue(parent, spanContextKey{}, span), span
 }
 
+// Track starts a leaf span and returns its closer:
+//
+//	defer tracer.Track(ctx, "ffmpeg-extract")()
+//
+// The span starts when Track is evaluated and ends when the closer runs.
+// Track cannot return a context, so nothing can nest under it — leaf-only
+// by construction. On a nil Tracer the returned closer is still callable.
+func (tracer *Tracer) Track(ctx context.Context, name string, attrs ...slog.Attr) func() {
+	// Discarding the child context is the design, not an omission: with no
+	// ctx returned, nothing can ever nest under a Track span — leaf-only is
+	// enforced by the signature instead of documentation. And span.End as a
+	// method value is nil-safe (End on a nil *Span is a no-op), so tracing
+	// off still hands back a callable closer.
+	_, span := tracer.Start(ctx, name, attrs...)
+	return span.End
+}
+
+// defaultTracer backs the package-level mirrors. There is no ambient
+// default: until SetDefault, package-level calls are no-ops (nil is off).
+var defaultTracer atomic.Pointer[Tracer]
+
+// SetDefault makes tracer the one used by the package-level Start and
+// Track — the slog.SetDefault pattern.
+func SetDefault(tracer *Tracer) {
+	defaultTracer.Store(tracer)
+}
+
+// Default returns the tracer set by SetDefault, or nil if none was set.
+func Default() *Tracer {
+	return defaultTracer.Load()
+}
+
+// Start begins a span on the default tracer. See Tracer.Start.
+func Start(ctx context.Context, name string, attrs ...slog.Attr) (context.Context, *Span) {
+	return Default().Start(ctx, name, attrs...)
+}
+
+// Track starts a leaf span on the default tracer. See Tracer.Track.
+func Track(ctx context.Context, name string, attrs ...slog.Attr) func() {
+	return Default().Track(ctx, name, attrs...)
+}
+
 // send enqueues an event for the writer. Full buffer: drop and count
 // (default) or block until there is room (WithBlockingPolicy); Close
 // unblocks blocked producers. After Close, send is a pure no-op.
 //
 //nolint:gocritic // hugeParam: by-value is deliberate — a pointer would make every event escape to the heap on the hot path; chunk-8 benchmarks hold this accountable
 func (tracer *Tracer) send(event Event) {
+	// Closed comes first and is a pure no-op, not a drop: Dropped measures
+	// buffer pressure on a live tracer, and counting post-Close sends would
+	// pollute that signal with lifecycle noise.
 	if tracer.closed.Load() {
 		return
 	}
 	if tracer.blocking {
+		// The stop channel is Close's escape hatch: a producer blocked on a
+		// full buffer must never outlive the tracer, so Close closes stop
+		// and every blocked send falls through (the event is lost, which
+		// Close's drain semantics accept for post-Close stragglers).
 		select {
 		case tracer.events <- event:
 		case <-tracer.stop:
 		}
 		return
 	}
+	// The default arm is the entire hot-path promise: a full buffer costs
+	// one atomic increment and returns — producers never stall on the
+	// destination, no matter how sick it is.
 	select {
 	case tracer.events <- event:
 	default:
@@ -193,6 +256,11 @@ func (tracer *Tracer) send(event Event) {
 // are never the reason the traced program goes down: the failure is logged
 // (rate-limited) and swallowed.
 func (tracer *Tracer) guard() {
+	// recover only works when called directly by the deferred function, so
+	// every public entry writes "defer tracer.guard()" rather than wrapping
+	// its body. This catches gospan's own bugs only — a caller's panic
+	// passes through untouched (their defers, including span.End, still
+	// run; that's how a panicking span gets its end time).
 	if r := recover(); r != nil {
 		tracer.warn("gospan: recovered internal panic", slog.Any("panic", r))
 	}
@@ -203,6 +271,11 @@ func (tracer *Tracer) warn(msg string, attrs ...slog.Attr) {
 	if tracer == nil || tracer.logger == nil {
 		return
 	}
+	// At most one warning per wall-clock second, coordinated by CAS: every
+	// caller in the same second sees now == last and stays quiet, and of
+	// the racers crossing into a new second exactly one wins the swap.
+	// Losing a complaint is fine — flooding the caller's log is not, and
+	// the counters in Stats never lose anything.
 	now := time.Now().Unix()
 	last := tracer.lastWarn.Load()
 	if now == last || !tracer.lastWarn.CompareAndSwap(last, now) {
