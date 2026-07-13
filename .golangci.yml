@@ -1,0 +1,101 @@
+version: "2"
+
+linters:
+  default: standard
+  enable:
+    # Core correctness
+    - govet
+    - staticcheck
+    - errcheck
+    - ineffassign
+    - unused
+
+    # Security & robustness
+    - gosec
+    - errorlint
+
+    # Style & maintainability
+    - gocritic
+    - misspell
+    - unconvert
+    - nolintlint
+    - varnamelen
+
+    # Strict correctness
+    - exhaustive
+    - depguard
+    - forbidigo
+    - gochecknoinits
+    - copyloopvar
+
+  settings:
+    # Abbreviations are a readability tax, not a benefit. Names under three
+    # characters are flagged; the exceptions are common, well-known, and
+    # unambiguous. Note the linter measures length only — a three-character
+    # abbreviation like cfg passes mechanically but is still a review defect;
+    # spell it out.
+    varnamelen:
+      min-name-length: 3
+      ignore-names:
+        - "i"   # loop counters
+        - "j"   # loop counters
+        - "k"   # loop counters
+        - "id"  # common identifier
+        - "err" # common error variable
+        - "ok"  # comma-ok idiom (map/type-assert/channel)
+        - "ctx" # common context variable
+        - "db"  # common database variable
+        - "tx"  # common database variable
+        - "tc"  # common test case variable
+
+    depguard:
+      rules:
+        # D19: the core module has ZERO third-party dependencies — stdlib
+        # only. The linter, not a doc, is what holds the line.
+        core-zero-deps:
+          files:
+            - "!**/sqlite/**"
+          allow:
+            - "$gostd"
+            - "github.com/akmadian/gospan"
+        # The nested sqlite module carries exactly one driver (D15/D19).
+        sqlite-module:
+          files:
+            - "**/sqlite/**"
+          allow:
+            - "$gostd"
+            - "github.com/akmadian/gospan"
+            - "modernc.org/sqlite"
+
+    exhaustive:
+      default-signifies-exhaustive: true
+
+    forbidigo:
+      forbid:
+        - pattern: "fmt\\.Print(ln|f)?"
+          msg: "a library never writes to stdout — return, log via the injected logger, or drop it"
+        - pattern: "os\\.Exit"
+          msg: "a library never exits the process"
+
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - performance
+
+  exclusions:
+    presets:
+      - comments
+      - common-false-positives
+      - std-error-handling
+    rules:
+      - linters: [forbidigo]
+        path: "_test\\.go$"
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
