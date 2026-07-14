@@ -161,3 +161,21 @@ func (sink *Sink) Path() string {
 func (sink *Sink) Close() error {
 	return sink.db.Close()
 }
+
+// OpenReadHandle opens a new, genuinely read-only connection to the live
+// trace file, so a caller can query mid-run while the writer goroutine
+// keeps its own connection: WAL readers never block the one writer. Each
+// call opens a fresh handle; the caller closes it when done. Keep read
+// transactions short — a long-lived read transaction pins the WAL against
+// checkpointing, growing the -wal file for as long as it is held.
+func (sink *Sink) OpenReadHandle() (*sql.DB, error) {
+	// mode=ro makes read-only an SQLite-enforced property of the
+	// connection (writes fail with SQLITE_READONLY), not a convention the
+	// caller is trusted to follow — the sink stays the file's only writer.
+	db, err := sql.Open("sqlite", "file:"+sink.path+"?mode=ro")
+	if err != nil {
+		return nil, fmt.Errorf("gospan/sqlite: opening %s for reading: %w", sink.path, err)
+	}
+	db.SetMaxOpenConns(1)
+	return db, nil
+}

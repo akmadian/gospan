@@ -49,7 +49,8 @@ func (t *Tracer) Summary() map[string]SpanSummary // your code's performance, by
 func (t *Tracer) Close(ctx context.Context) error
 
 type Stats struct {
-    Started, Completed, Written, Dropped uint64        // cumulative since New
+    Started, Completed uint64                          // SPANS, cumulative since New
+    Written, Dropped   uint64                          // queue EVENTS (start/end/attr updates, ~2–3 per span), cumulative
     SpansInFlight, TracesInFlight, QueueDepth int      // this instant
     WriteErrors uint64                                  // failed batch commits (degraded, counted)
     OverheadPerSpan time.Duration                       // rolling average tracer-added cost
@@ -111,7 +112,10 @@ One repo, two Go modules, one external viewer repo:
   (construction is where its errors surface) and mints one
   auto-named file per run (`gospan-<utc-timestamp>-<pid>.sqlite`; no
   collision semantics exist because no two runs share a file; multi-run
-  analysis is ATTACH across siblings; the sink exposes `Path()`). Carries
+  analysis is ATTACH across siblings; the sink exposes `Path()`, and
+  `OpenReadHandle() (*sql.DB, error)` — a fresh SQLite-enforced read-only
+  connection (`mode=ro`) for live mid-run queries: WAL readers never block
+  the one writer, and the sink stays the file's only writer). Carries
   `modernc.org/sqlite`; users who don't import this module never see it, not
   even in go.sum. Also home to **`serve`**: an `http.Handler` exposing a
   consistent snapshot of the live DB at `/trace.db` (`VACUUM INTO`;

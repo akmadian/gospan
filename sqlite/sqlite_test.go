@@ -8,6 +8,8 @@ import (
 	"regexp"
 	"testing"
 	"time"
+
+	"github.com/akmadian/gospan"
 )
 
 func newTestSink(t *testing.T) *Sink {
@@ -148,5 +150,39 @@ func TestSchemaIsStrictAndWAL(t *testing.T) {
 	}
 	if indexCount != 1 {
 		t.Error("the spans_by_trace index (the waterfall query's index) must exist")
+	}
+}
+
+func TestOpenReadHandle_ReadsLiveAndRefusesWrites(t *testing.T) {
+	sink := newTestSink(t)
+	// A span written through the sink's own path, mid-run (file not closed).
+	if err := sink.WriteBatch(gospan.Batch{Events: []gospan.Event{
+		startEvent(1, "work"), endEvent(1, "work"),
+	}}); err != nil {
+		t.Fatalf("WriteBatch: %v", err)
+	}
+	if err := sink.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	db, err := sink.OpenReadHandle()
+	if err != nil {
+		t.Fatalf("OpenReadHandle: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	// Reads see the writer's committed state while the sink is still open.
+	var rows int
+	if err := db.QueryRow("SELECT COUNT(*) FROM spans").Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 1 {
+		t.Errorf("read handle sees %d span rows, want 1", rows)
+	}
+
+	// Writes are refused by the connection itself (mode=ro): the sink must
+	// remain the file's only writer, enforced, not trusted.
+	if _, err := db.Exec(`INSERT INTO names (id, name) VALUES (99, 'intruder')`); err == nil {
+		t.Fatal("a write through the read handle must fail — the handle is not read-only")
 	}
 }
