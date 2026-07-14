@@ -32,8 +32,8 @@ never retag or force-push a release; fix forward with a new version.
    git push origin sqlite/v0.X.Y
    ```
 
-## First release only
+## Between releases
 
-`sqlite/go.mod` deliberately omits the core requirement while nothing is
-published (the workspace supplies the sibling). The `go get` in step 1
-adds it — expected, one-time.
+`sqlite/go.mod` pins core at a pseudo-version of the pushed head (the
+committed go.work overrides it in-repo). The `go get` in step 1 replaces
+it with the real tag — expected.

@@ -2,12 +2,14 @@ module github.com/akmadian/gospan/sqlite
 
 go 1.25.0
 
-// github.com/akmadian/gospan is deliberately not required yet: no pushed
-// commit exists to pin a pseudo-version against, and the committed
-// go.work resolves the core module locally for dev and CI (the OTel
-// multi-module pattern — never a replace directive, which would break
-// downstream consumers). `go mod tidy` here pins the real version at
-// first push.
+// The core requirement pins a published version so this module builds
+// standalone for consumers; in this repo the committed go.work overrides
+// it with the sibling directory, so dev and CI always test against the
+// checked-out core (the OTel multi-module pattern — never a replace
+// directive, which would break downstream consumers). Releases move it
+// to a real tag per docs/RELEASING.md.
+require github.com/akmadian/gospan v0.0.0-20260713235001-fe90f6de42d6
+
 require modernc.org/sqlite v1.53.0
 
 require (
