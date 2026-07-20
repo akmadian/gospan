@@ -8,7 +8,7 @@ go 1.25.0
 // checked-out core (the OTel multi-module pattern — never a replace
 // directive, which would break downstream consumers). Releases move it
 // to a real tag per docs/RELEASING.md.
-require github.com/akmadian/gospan v0.0.0-20260713235001-fe90f6de42d6
+require github.com/akmadian/gospan v0.0.1
 
 require modernc.org/sqlite v1.53.0
 
