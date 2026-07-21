@@ -108,22 +108,25 @@ One repo, two Go modules, one external viewer repo:
 - **`gospan` (core module): zero third-party dependencies — stdlib only.**
   Tracer, Span, Sink, SlogSink, Stats, Summary.
 - **`gospan/sqlite` (nested module, own go.mod):** the flagship sink —
-  `sqlite.New(dir string) (Sink, error)` creates the directory if absent
-  (construction is where its errors surface) and mints one
+  `sqlite.New(dir string, opts ...Option) (*Sink, error)` creates the directory if absent
+  (construction is where its errors surface) and, by default, mints one
   auto-named file per run (`gospan-<utc-timestamp>-<pid>.sqlite`; no
   collision semantics exist because no two runs share a file; multi-run
   analysis is ATTACH across siblings; the sink exposes `Path()`, and
   `OpenReadHandle() (*sql.DB, error)` — a fresh SQLite-enforced read-only
   connection (`mode=ro`) for live mid-run queries: WAL readers never block
-  the one writer, and the sink stays the file's only writer). Carries
-  `modernc.org/sqlite`; users who don't import this module never see it, not
-  even in go.sum. Also home to **`serve`**: an `http.Handler` exposing a
-  consistent snapshot of the live DB at `/trace.db` (`VACUUM INTO`;
-  snapshots made on request, cached briefly, zero cost when no client asks).
+  the one writer, and the sink stays the file's only writer). `WithName(name,
+  overwrite)` swaps the auto-name for a stable, optionally-overwritten path
+  (D30). Carries `modernc.org/sqlite`; users who don't import this module
+  never see it, not even in go.sum. A live-snapshot **`serve`** handler (an
+  `http.Handler` exposing a `VACUUM INTO` snapshot of the live DB at
+  `/trace.db`) is **deferred out of v1** (D26): it lands here when the
+  viewer's live mode needs it — see DEFERRED.md.
 - **The viewer is a separate repository** (producer and consumer have
   different lifecycles and toolchains). It consumes §3–§5 of this spec as a
-  cross-repo contract: completed files via drag-and-drop (WASM SQLite), live
-  state by polling a `serve` snapshot URL. It builds to static assets — the
+  cross-repo contract: completed files via drag-and-drop (WASM SQLite), and —
+  once the deferred `serve` handler lands — live state by polling its snapshot
+  URL. It builds to static assets — the
   zero-server, open-a-page, drag-a-file experience is unchanged.
 
 ## 2. Semantics
@@ -135,7 +138,7 @@ One repo, two Go modules, one external viewer repo:
 | Status | `0 ok · 1 error · 2 canceled`. `Fail(err)` sets error, or canceled when `errors.Is(err, context.Canceled)` / `DeadlineExceeded`; records `err.Error()`; `Fail(nil)` is a no-op; last `Fail` before `End` wins. |
 | End | First `End` wins; all mutations after `End` (SetAttrs, Fail, second End) are no-ops. `End` never blocks beyond a channel send. |
 | Cross-goroutine | `End`/`Fail`/`SetAttrs` are safe from any goroutine, not just `Start`'s. |
-| Attrs | Last write per key wins (enforced by the writer, cheap append at the call site). Values are `slog.Attr`; `Group` attrs are flattened with `.`-joined keys. Oversized values may be truncated with a marker (limit documented at implementation). |
+| Attrs | Last write per key wins (enforced by the writer, cheap append at the call site). Values are `slog.Attr`; `Group` attrs are flattened with `.`-joined keys. Oversized values are stored verbatim today; a size cap with a truncation marker is deferred (see DEFERRED.md). |
 | Track | Leaf-only by construction: it cannot return a ctx, so nothing nests under it. `defer tracer.Track(ctx, "x")()` — span starts at evaluation, ends when the closure runs. |
 | Panic safety | `defer`red `End` runs on panic — the span gets an end time. gospan never recovers the *caller's* panics; it only recovers its own. |
 | Incomplete spans | A span with `end_ns IS NULL` in a closed file never received `End` (crash, `os.Exit`, dropped end event). Flagged in the viewer; never diagnosed further. |

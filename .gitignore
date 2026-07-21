@@ -30,3 +30,4 @@ profile.cov
 
 # gospan-demo writes its trace file into the working directory
 gospan-demo.sqlite*
+docs/scratch.md

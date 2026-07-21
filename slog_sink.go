@@ -26,8 +26,19 @@ func SlogSink(logger *slog.Logger) Sink {
 	}
 }
 
+// maxOpenSlogSpans caps the open-span map. In steady state open holds only
+// spans currently in flight — each entry is deleted when its end event
+// arrives — but an end lost to buffer pressure would otherwise strand its
+// entry until Close, an unbounded leak under sustained drops. The cap holds
+// it to a bounded set; past it a new span's pre-end attrs go untracked (its
+// end still emits a record, just without them). 65536 is far above any
+// realistic in-flight count for a per-span log emitter, so healthy runs
+// never reach it.
+const maxOpenSlogSpans = 1 << 16
+
 // openSpan accumulates what the log record needs until the end event
-// arrives. Bounded by spans currently in flight.
+// arrives. Normally bounded by spans in flight (each is deleted at its end);
+// the maxOpenSlogSpans cap bounds it even when end events are lost.
 type openSpan struct {
 	attrs []slog.Attr
 }
@@ -48,6 +59,15 @@ func (sink *slogSink) WriteBatch(batch Batch) error {
 			// copied — the batch must not be retained.
 			span := sink.open[event.SpanID]
 			if span == nil {
+				// Past the cap, stop tracking new spans: a later end still
+				// emits (emit tolerates a missing entry), just without the
+				// pre-end attrs. This bounds the open map when end events are
+				// dropped under buffer pressure — the same drop-and-count
+				// posture the tracer's buffer uses — instead of leaking until
+				// Close.
+				if len(sink.open) >= maxOpenSlogSpans {
+					continue
+				}
 				span = &openSpan{}
 				sink.open[event.SpanID] = span
 			}

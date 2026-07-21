@@ -80,6 +80,16 @@ attributable to span creation.
 Keys are inline TEXT (deliberate asymmetry with interned span names).
 **Trigger:** real trace files measurably bloated by repeated keys.
 
+## Attr value size cap (truncation with a marker)
+Oversized attribute values are stored verbatim today. A size cap that
+truncates over-long values with a marker would bound file and memory growth
+from an accidental multi-MB attribute. Deferred with its open questions: the
+limit, truncating on a byte vs. rune boundary, and whether the slog sink
+truncates too or leaves that to the logger. SPEC §2 is worded to promise
+nothing until this lands.
+**Trigger:** a real trace file bloated by an oversized attr value, or a
+measured memory spike traced to one.
+
 ## Gauge/counter samples table
 "Queue depth over time" as sampled values. v1 derives it from open-span
 counts (window queries over intervals), which covers the motivating cases.
