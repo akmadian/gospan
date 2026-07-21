@@ -210,8 +210,9 @@ Go library. The contract between them is SPEC.md's schema and file-format
 sections. The viewer's own toolchain is its own business (a React app is
 fine); what's invariant is the *user's* experience: it builds to static
 assets, runs zero servers, and reads trace data two ways — a completed
-`.sqlite` file via drag-and-drop (WASM SQLite, real SQL client-side), or a
-live run by polling a `serve` snapshot URL. What it renders:
+`.sqlite` file via drag-and-drop (WASM SQLite, real SQL client-side), or —
+once the deferred `serve` handler lands (D26) — a live run by polling its
+snapshot URL. What it renders:
 
 - **Waterfall per trace**: rows = spans, x = time, indentation = nesting, bar
   = duration, gaps = waiting. Deliberately not a graph layout — timelines stay
@@ -221,10 +222,11 @@ live run by polling a `serve` snapshot URL. What it renders:
 - Incomplete spans (`end_ns IS NULL`) rendered visibly different — "no end
   recorded" — never diagnosed into a story the data can't back.
 
-**Live-ish mode** comes from `serve` (in the `gospan/sqlite` module — it's
-meaningless without a database file): an HTTP handler exposing a consistent
-snapshot of the live DB at `/trace.db` (`VACUUM INTO` — you can't serve a
-WAL file's bytes mid-write). Refresh = current state within one flush
+**Live-ish mode** will come from `serve` — **deferred out of v1** (D26; its
+trigger is the viewer's live mode). In the `gospan/sqlite` module (it's
+meaningless without a database file), it is an HTTP handler exposing a
+consistent snapshot of the live DB at `/trace.db` (`VACUUM INTO` — you can't
+serve a WAL file's bytes mid-write). Refresh = current state within one flush
 interval. True streaming is deliberately out (see DEFERRED.md);
 snapshot-on-refresh costs nothing when no client asks and changes no core
 design.
@@ -239,7 +241,8 @@ timestamps. Published benchmark numbers in the README (`go test -bench`) plus
 live self-reported cost (`Stats().OverheadPerSpan`, `Dropped`) — "here's what
 it's costing you on your hardware right now" beats any static claim.
 
-Benchmarks run in CI on every commit; a performance regression is a blocking
-defect, same as a failed test. Concrete SLA numbers (ns/op, allocs/op
-ceilings) get defined once the first real benchmarks exist to calibrate
-against — published, then enforced.
+Benchmarks run in CI on every commit. The allocation ceilings are defined and
+enforced (`TestAllocationCeilings` — a regression fails the build, same as a
+failed test); ns/op is published in the README and, being machine-dependent,
+is defended on PRs by a same-runner benchstat A/B rather than a fixed
+threshold.

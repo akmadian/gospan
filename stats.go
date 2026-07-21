@@ -20,6 +20,13 @@ type Stats struct {
 	Written   uint64 // events accepted by the sink
 	Dropped   uint64 // events lost to a full buffer
 
+	// SummaryDropped counts completed spans not folded into Summary()
+	// because its distinct-name cap was reached. Not data loss — the sink
+	// still receives those spans and the trace file holds them exactly, only
+	// the in-memory per-name rollup omits them. A nonzero value means span
+	// names carry high-cardinality data that belongs in attributes.
+	SummaryDropped uint64
+
 	// This instant.
 	SpansInFlight  int // started, not yet ended
 	TracesInFlight int // root spans still open
@@ -49,6 +56,7 @@ func (tracer *Tracer) Stats() Stats {
 		Completed:       tracer.completed.Load(),
 		Written:         tracer.written.Load(),
 		Dropped:         tracer.dropped.Load(),
+		SummaryDropped:  tracer.summaryDropped.Load(),
 		SpansInFlight:   int(tracer.spansInFlight.Load()),  // counts concurrently-open spans, nowhere near 2^31
 		TracesInFlight:  int(tracer.tracesInFlight.Load()), // same bound
 		QueueDepth:      len(tracer.events),

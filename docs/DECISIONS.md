@@ -252,3 +252,54 @@ Slightly off the core path, so it moves to DEFERRED.md with the viewer as
 its trigger. Nothing in the write path or schema changes when it lands:
 the file is the interface either way, and D24's `VACUUM INTO` mechanism
 stands. Requested by Ari during the implementation round.
+
+## 2026-07-17 — Pre-1.0 hardening round
+
+**D27 — `spans_named` view shipped in the schema.** Every human query starts
+by joining `spans` to `names` to recover the span name, and most also compute
+`end_ns - start_ns`. A `CREATE VIEW spans_named` (spans ⨝ names, exposing
+`name` and a derived `duration_ns`) erases that boilerplate for ad-hoc SQL and
+the new `sqlite/scripts/`. A view is additive — it adds no table, changes no
+existing reader, and needs no `schema_version` bump — but it edits the frozen
+§3 schema surface, so it lands as a deliberate versioned addition, not a
+casual edit. This is the trigger DEFERRED's "query ergonomics" named: the
+first external users. The write path is untouched; `duration_ns` is NULL while
+a span is running or incomplete. Requested by Ari for the pre-1.0 testing
+round.
+
+**D28 — Multi-row `VALUES` inserts rejected for the pure-Go driver, on
+measurement.** DEFERRED's write-throughput ladder named multi-row inserts its
+step 1 ("2–5×, no doctrine cost"). Implemented and benchmarked (same runner,
+back-to-back A/B, n=8, p<0.001), it *regressed* throughput ~44% (≈271k → ≈151k
+spans/sec on the coalesced case) while halving allocations. The cause is
+inherent to `modernc.org/sqlite`: parsing a 1024-placeholder statement per
+flush costs more CPU than the per-row stepping it saves — the ladder's premise
+was CGO-world intuition that does not survive the pure-Go VM. Reverted; the
+per-row prepared-statement loop stands. The promising lever for this driver is
+instead reusing one prepared statement *across* flushes (eliminating the
+per-flush parse), left unbuilt until measured. DEFERRED's ladder note updated
+with the numbers so it is not re-attempted blind.
+
+**D29 — Relicensed GPL-3.0 → Apache-2.0.** For an embeddable library, strong
+copyleft is an adoption blocker: much organizational legal review rejects
+(L)GPL dependencies outright, and Go's static linking leaves the copyleft
+boundary murky enough that most will not risk it — directly at odds with a
+thin core built for broad adoption. Apache-2.0 over MIT/BSD for its explicit
+patent grant (the org-friendly default for infrastructure libraries). Decided
+before opening to external testers, while gospan is still the sole copyright
+holder and relicensing needs no contributor consent. Requested by Ari during
+the pre-1.0 readiness review.
+
+**D30 — `sqlite.WithName` for stable, overwritable trace file names.** The
+default stays one auto-named `gospan-<timestamp>-<pid>.sqlite` per run (D17,
+so runs never collide and accumulate as ATTACH-able siblings). But a consumer
+that wants a *known* path — to point a script, a `sqlite3` session, or the
+demo at a fixed file — can pass `sqlite.WithName(name, overwrite)`. A relative
+name lands in `dir`; an absolute one is used as-is. The collision default is
+the careful one: an existing file is an error at construction, so a rerun
+never silently destroys the last trace; `overwrite=true` is the explicit
+opt-in and removes the file plus its `-wal`/`-shm` sidecars first. Appending
+two runs into one file is *not* offered — it would fold their IDs together,
+which the per-file `file_id` (D2) exists to keep separate. Naming is
+API/behavior only; the frozen §3–§5 file format is untouched. Requested by Ari
+during pre-1.0 testing, so the demo can name the file it then queries by path.

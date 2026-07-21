@@ -49,7 +49,8 @@ func (t *Tracer) Summary() map[string]SpanSummary // your code's performance, by
 func (t *Tracer) Close(ctx context.Context) error
 
 type Stats struct {
-    Started, Completed, Written, Dropped uint64        // cumulative since New
+    Started, Completed uint64                          // SPANS, cumulative since New
+    Written, Dropped   uint64                          // queue EVENTS (start/end/attr updates, ~2–3 per span), cumulative
     SpansInFlight, TracesInFlight, QueueDepth int      // this instant
     WriteErrors uint64                                  // failed batch commits (degraded, counted)
     OverheadPerSpan time.Duration                       // rolling average tracer-added cost
@@ -107,19 +108,25 @@ One repo, two Go modules, one external viewer repo:
 - **`gospan` (core module): zero third-party dependencies — stdlib only.**
   Tracer, Span, Sink, SlogSink, Stats, Summary.
 - **`gospan/sqlite` (nested module, own go.mod):** the flagship sink —
-  `sqlite.New(dir string) (Sink, error)` creates the directory if absent
-  (construction is where its errors surface) and mints one
+  `sqlite.New(dir string, opts ...Option) (*Sink, error)` creates the directory if absent
+  (construction is where its errors surface) and, by default, mints one
   auto-named file per run (`gospan-<utc-timestamp>-<pid>.sqlite`; no
   collision semantics exist because no two runs share a file; multi-run
-  analysis is ATTACH across siblings; the sink exposes `Path()`). Carries
-  `modernc.org/sqlite`; users who don't import this module never see it, not
-  even in go.sum. Also home to **`serve`**: an `http.Handler` exposing a
-  consistent snapshot of the live DB at `/trace.db` (`VACUUM INTO`;
-  snapshots made on request, cached briefly, zero cost when no client asks).
+  analysis is ATTACH across siblings; the sink exposes `Path()`, and
+  `OpenReadHandle() (*sql.DB, error)` — a fresh SQLite-enforced read-only
+  connection (`mode=ro`) for live mid-run queries: WAL readers never block
+  the one writer, and the sink stays the file's only writer). `WithName(name,
+  overwrite)` swaps the auto-name for a stable, optionally-overwritten path
+  (D30). Carries `modernc.org/sqlite`; users who don't import this module
+  never see it, not even in go.sum. A live-snapshot **`serve`** handler (an
+  `http.Handler` exposing a `VACUUM INTO` snapshot of the live DB at
+  `/trace.db`) is **deferred out of v1** (D26): it lands here when the
+  viewer's live mode needs it — see DEFERRED.md.
 - **The viewer is a separate repository** (producer and consumer have
   different lifecycles and toolchains). It consumes §3–§5 of this spec as a
-  cross-repo contract: completed files via drag-and-drop (WASM SQLite), live
-  state by polling a `serve` snapshot URL. It builds to static assets — the
+  cross-repo contract: completed files via drag-and-drop (WASM SQLite), and —
+  once the deferred `serve` handler lands — live state by polling its snapshot
+  URL. It builds to static assets — the
   zero-server, open-a-page, drag-a-file experience is unchanged.
 
 ## 2. Semantics
@@ -131,7 +138,7 @@ One repo, two Go modules, one external viewer repo:
 | Status | `0 ok · 1 error · 2 canceled`. `Fail(err)` sets error, or canceled when `errors.Is(err, context.Canceled)` / `DeadlineExceeded`; records `err.Error()`; `Fail(nil)` is a no-op; last `Fail` before `End` wins. |
 | End | First `End` wins; all mutations after `End` (SetAttrs, Fail, second End) are no-ops. `End` never blocks beyond a channel send. |
 | Cross-goroutine | `End`/`Fail`/`SetAttrs` are safe from any goroutine, not just `Start`'s. |
-| Attrs | Last write per key wins (enforced by the writer, cheap append at the call site). Values are `slog.Attr`; `Group` attrs are flattened with `.`-joined keys. Oversized values may be truncated with a marker (limit documented at implementation). |
+| Attrs | Last write per key wins (enforced by the writer, cheap append at the call site). Values are `slog.Attr`; `Group` attrs are flattened with `.`-joined keys. Oversized values are stored verbatim today; a size cap with a truncation marker is deferred (see DEFERRED.md). |
 | Track | Leaf-only by construction: it cannot return a ctx, so nothing nests under it. `defer tracer.Track(ctx, "x")()` — span starts at evaluation, ends when the closure runs. |
 | Panic safety | `defer`red `End` runs on panic — the span gets an end time. gospan never recovers the *caller's* panics; it only recovers its own. |
 | Incomplete spans | A span with `end_ns IS NULL` in a closed file never received `End` (crash, `os.Exit`, dropped end event). Flagged in the viewer; never diagnosed further. |
@@ -178,6 +185,15 @@ CREATE TABLE attrs (
     value   ANY,                        -- SQLite cells are natively typed
     PRIMARY KEY (span_id, key)
 ) STRICT, WITHOUT ROWID;
+
+-- Convenience view (additive; no schema_version bump — D27). Resolves the
+-- names join and the derived duration every human query needs; readers that
+-- only want the tables ignore it. duration_ns is NULL while end_ns is NULL.
+CREATE VIEW spans_named AS
+    SELECT s.id, s.trace_id, s.parent_id, n.name,
+           s.start_ns, s.end_ns, s.end_ns - s.start_ns AS duration_ns,
+           s.status, s.error
+    FROM spans s JOIN names n ON n.id = s.name_id;
 ```
 
 Write path: span row inserted at first flush after `Start` (`end_ns` NULL);
@@ -211,7 +227,9 @@ cross-query.
   meaning.
 - Status enum values are frozen (`0/1/2`); additions append.
 - The viewer must tolerate: NULL `end_ns`, missing parents (render at top
-  level, flagged), unknown `kind` values (render raw), and files larger than
+  level, flagged), unknown `kind` values (render raw), additive schema
+  objects it does not recognize (a new view like `spans_named`, or — under a
+  `schema_version` bump — new tables/columns), and files larger than
   comfortable (degrade, don't crash — the WASM engine loads files fully into
   browser memory; this tool is for single-run and modest multi-run analysis,
   not a warehouse).

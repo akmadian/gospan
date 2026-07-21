@@ -275,6 +275,42 @@ func TestFlushFailureDropsPendingAndReports(t *testing.T) {
 	}
 }
 
+func TestFailedFlushDoesNotPoisonNameCache(t *testing.T) {
+	// The degraded path: a flush that interns a brand-new name but then
+	// rolls back must not leave that name in the committed cache. A later
+	// span reusing the name would otherwise reference a names row that was
+	// rolled back — the span vanishes from, or is mislabeled by, the
+	// canonical spans⨝names join, silently. That is exactly the kind of
+	// failure gospan promises to make safe and discoverable.
+	sink := newTestSink(t)
+
+	// Drive the real Begin/writePending path, interning "foo" inside a
+	// transaction, then roll back instead of commit.
+	tx, err := sink.db.Begin()
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	sink.pendingSpans = []*spanRow{{id: 1, traceID: 1, name: "foo", startNS: 1000}}
+	if err := sink.writePending(tx); err != nil {
+		t.Fatalf("writePending: %v", err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("Rollback: %v", err)
+	}
+	sink.clearPending() // what Flush's deferred cleanup does after a failure
+
+	if _, poisoned := sink.nameIDs["foo"]; poisoned {
+		t.Fatal("a rolled-back name leaked into the committed cache — a later span would reference a names row that no longer exists")
+	}
+
+	// Recovery: a later successful flush reusing the same name must produce
+	// a row that joins to the correct name.
+	writeAndFlush(t, sink, startEvent(2, "foo"), endEvent(2, "foo"))
+	if record := readSpan(t, openForInspection(t, sink.Path()), 2); record.name != "foo" {
+		t.Errorf("span name = %q, want foo — interning must recover after a failed flush", record.name)
+	}
+}
+
 func TestEndToEndThroughTheTracer(t *testing.T) {
 	sink, err := New(t.TempDir())
 	if err != nil {

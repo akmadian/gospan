@@ -107,6 +107,13 @@ func (sink *Sink) Flush() error {
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("gospan/sqlite: committing: %w", err)
 	}
+	// The commit is durable: the names inserted this flush now exist on
+	// disk, so promote them into the committed cache for reuse. Only after a
+	// successful commit — never before — so a rolled-back flush can never
+	// poison nameIDs (see internName).
+	for name, id := range sink.internedThisFlush {
+		sink.nameIDs[name] = id
+	}
 	return nil
 }
 
@@ -114,6 +121,7 @@ func (sink *Sink) clearPending() {
 	sink.pendingSpans = sink.pendingSpans[:0]
 	sink.pendingAttrs = sink.pendingAttrs[:0]
 	clear(sink.pendingByID)
+	clear(sink.internedThisFlush)
 }
 
 func (sink *Sink) writePending(tx *sql.Tx) error {
@@ -174,7 +182,12 @@ func (sink *Sink) writePending(tx *sql.Tx) error {
 // sight. Span names are a small, stable set (~dozens), so the in-memory
 // map makes interning one lookup on the steady path.
 func (sink *Sink) internName(tx *sql.Tx, name string) (int64, error) {
+	// Committed names first, then names already inserted earlier in THIS
+	// transaction — either way a hit avoids a duplicate INSERT.
 	if id, seen := sink.nameIDs[name]; seen {
+		return id, nil
+	}
+	if id, seen := sink.internedThisFlush[name]; seen {
 		return id, nil
 	}
 	result, err := tx.Exec("INSERT INTO names (name) VALUES (?)", name)
@@ -185,7 +198,12 @@ func (sink *Sink) internName(tx *sql.Tx, name string) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("gospan/sqlite: reading interned id for %q: %w", name, err)
 	}
-	sink.nameIDs[name] = id
+	// Held aside, not committed: promoted into nameIDs only after this
+	// flush's transaction commits (see Flush). Writing straight to nameIDs
+	// here would survive a rollback and leave a span pointing at a names row
+	// that was rolled back — the span then vanishes from, or is mislabeled
+	// by, the canonical spans⨝names join, silently, on the degraded path.
+	sink.internedThisFlush[name] = id
 	return id, nil
 }
 

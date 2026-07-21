@@ -117,7 +117,8 @@ type Tracer struct {
 	written        atomic.Uint64
 	spansInFlight  atomic.Int64
 	tracesInFlight atomic.Int64
-	overheadNS     atomic.Int64 // EMA of sampled per-span tracer cost
+	overheadNS     atomic.Int64  // EMA of sampled per-span tracer cost
+	summaryDropped atomic.Uint64 // completed spans past Summary's distinct-name cap
 
 	// summaries holds the per-name aggregates behind Summary(). Owned by
 	// the writer goroutine; the mutex only mediates Summary() readers, so

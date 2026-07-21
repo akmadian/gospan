@@ -11,9 +11,9 @@ import (
 // Count, Errors, Canceled, Min, Max, and Mean are exact; the percentiles
 // are approximate, read from a log-bucketed histogram with relative error
 // bounded at ~12.5% (four linear sub-buckets per power of two, values
-// reported at bucket midpoints). Exact answers live in the trace file —
-// one SQL query away — so the in-process copy stays small and lock-free
-// on the hot path.
+// reported at bucket midpoints, then clamped into [Min, Max]). Exact
+// answers live in the trace file — one SQL query away — so the in-process
+// copy stays small and lock-free on the hot path.
 type SpanSummary struct {
 	Count    uint64
 	Errors   uint64
@@ -29,6 +29,14 @@ type SpanSummary struct {
 // Summary returns the per-name aggregates for every span name seen so
 // far. It is safe from any goroutine and cheap enough for a ticker; on a
 // nil Tracer it returns nil.
+//
+// Span names must stay low-cardinality: a small, stable set (~dozens),
+// with any varying data (request IDs, paths) carried in attributes rather
+// than the name. Each distinct name costs a small fixed-size histogram, so
+// Summary tracks only a bounded number of them and counts any completed
+// spans past that cap in Stats.SummaryDropped — an accidental
+// high-cardinality name degrades visibly instead of growing memory without
+// bound.
 func (tracer *Tracer) Summary() map[string]SpanSummary {
 	if tracer == nil {
 		return nil
@@ -41,6 +49,17 @@ func (tracer *Tracer) Summary() map[string]SpanSummary {
 	}
 	return result
 }
+
+// maxSummaryNames caps how many distinct span names Summary() tracks. Names
+// are meant to be a small, stable set (~dozens); each distinct one holds a
+// ~2KB histogram accumulator, so an accidental high-cardinality name (an ID
+// or path baked into the name string) could otherwise grow Summary memory
+// without bound and OOM the traced program. The cap holds that at ~8MB
+// (4096 × ~2KB) and turns the mistake into a counted, visible degradation
+// (Stats.SummaryDropped) — the same drop-and-count posture the event buffer
+// uses. Raise it only for a workload with thousands of genuinely distinct
+// span names.
+const maxSummaryNames = 4096
 
 // recordCompletedSpans folds a batch's end events into the per-name
 // accumulators. Called by the writer goroutine alongside sink delivery —
@@ -68,6 +87,15 @@ func (tracer *Tracer) recordCompletedSpans(batch []Event) {
 		}
 		accumulator := tracer.summaries[event.Name]
 		if accumulator == nil {
+			// Cardinality guard: past the cap, stop minting accumulators for
+			// new names and count the un-summarized ends instead. Existing
+			// names keep aggregating; the spans themselves still reach the
+			// sink, and exact per-span answers live in the trace file — only
+			// the in-memory per-name rollup omits the overflow.
+			if len(tracer.summaries) >= maxSummaryNames {
+				tracer.summaryDropped.Add(1)
+				continue
+			}
 			accumulator = &summaryAccumulator{}
 			tracer.summaries[event.Name] = accumulator
 		}
@@ -128,9 +156,14 @@ func (accumulator *summaryAccumulator) snapshot() SpanSummary {
 		// count grows one event at a time and can never approach 2^63,
 		// so the divisor conversion cannot overflow.
 		summary.Mean = time.Duration(accumulator.totalNanos / int64(accumulator.count)) //nolint:gosec // G115: see above
-		summary.P50 = accumulator.percentile(0.50)
-		summary.P90 = accumulator.percentile(0.90)
-		summary.P99 = accumulator.percentile(0.99)
+		// Percentiles are bucket midpoints, so a narrow distribution can push
+		// one just past the exact Min/Max (a lone 8ns span: Max=8ns, raw
+		// P50=9ns). Clamp into [Min, Max] — an observed percentile can never
+		// lie outside the observed range — which also preserves ordering,
+		// since percentile is monotonic in the requested fraction.
+		summary.P50 = clampDuration(accumulator.percentile(0.50), summary.Min, summary.Max)
+		summary.P90 = clampDuration(accumulator.percentile(0.90), summary.Min, summary.Max)
+		summary.P99 = clampDuration(accumulator.percentile(0.99), summary.Min, summary.Max)
 	}
 	return summary
 }
@@ -187,4 +220,17 @@ func durationForBucketIndex(index int) time.Duration {
 	lowerBound := int64(1)<<octave + int64(subBucket)<<(octave-2)
 	bucketWidth := int64(1) << (octave - 2)
 	return time.Duration(lowerBound + bucketWidth/2)
+}
+
+// clampDuration bounds value into [low, high]. Summary percentiles use it so
+// a bucket-midpoint estimate is never reported outside the exact [Min, Max]
+// the accumulator also tracks.
+func clampDuration(value, low, high time.Duration) time.Duration {
+	if value < low {
+		return low
+	}
+	if value > high {
+		return high
+	}
+	return value
 }

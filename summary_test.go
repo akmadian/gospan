@@ -3,6 +3,7 @@ package gospan
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"testing"
 	"testing/synctest"
@@ -133,6 +134,65 @@ func TestSummaryThroughTheTracer(t *testing.T) {
 		}
 		mustClose(t, tracer)
 	})
+}
+
+func TestSummaryNameCapCountsOverflow(t *testing.T) {
+	tracer, _ := newCaptureTracer(t)
+
+	// Fill exactly to the cap with distinct names, one completed span each.
+	// Driven straight through recordCompletedSpans (the writer is idle with
+	// no events in flight) so the cap is exercised deterministically.
+	atCap := make([]Event, 0, maxSummaryNames)
+	for i := 0; i < maxSummaryNames; i++ {
+		atCap = append(atCap, Event{Kind: EventEnd, Name: fmt.Sprintf("name-%d", i), EndNS: 100})
+	}
+	tracer.recordCompletedSpans(atCap)
+
+	if got := len(tracer.Summary()); got != maxSummaryNames {
+		t.Fatalf("Summary tracks %d names, want the cap %d", got, maxSummaryNames)
+	}
+	if got := tracer.Stats().SummaryDropped; got != 0 {
+		t.Fatalf("SummaryDropped = %d before the cap is exceeded, want 0", got)
+	}
+
+	// Past the cap: a brand-new name is dropped and counted, while an
+	// already-tracked name keeps aggregating.
+	tracer.recordCompletedSpans([]Event{
+		{Kind: EventEnd, Name: "over-the-cap", EndNS: 100},
+		{Kind: EventEnd, Name: "over-the-cap", EndNS: 100},
+		{Kind: EventEnd, Name: "name-0", EndNS: 100},
+	})
+
+	if got := len(tracer.Summary()); got != maxSummaryNames {
+		t.Errorf("Summary grew past the cap to %d names", got)
+	}
+	if got := tracer.Stats().SummaryDropped; got != 2 {
+		t.Errorf("SummaryDropped = %d, want 2 (two ends for a new name past the cap)", got)
+	}
+	if _, tracked := tracer.Summary()["over-the-cap"]; tracked {
+		t.Error("a name first seen past the cap must not appear in Summary")
+	}
+	if got := tracer.Summary()["name-0"].Count; got != 2 {
+		t.Errorf("existing name-0 Count = %d, want 2 — existing names keep aggregating past the cap", got)
+	}
+}
+
+func TestSummaryPercentilesClampedToMinMax(t *testing.T) {
+	// A single 8ns span: Min == Max == 8ns exactly, but the histogram bucket
+	// midpoint for 8ns is 9ns — so without clamping the percentiles would
+	// read above the true maximum. None may fall outside [Min, Max].
+	accumulator := &summaryAccumulator{}
+	accumulator.record(Event{Kind: EventEnd, StartNS: 0, EndNS: 8})
+	summary := accumulator.snapshot()
+
+	if summary.Min != 8 || summary.Max != 8 {
+		t.Fatalf("Min/Max = %v/%v, want 8ns/8ns exactly", summary.Min, summary.Max)
+	}
+	for name, value := range map[string]time.Duration{"P50": summary.P50, "P90": summary.P90, "P99": summary.P99} {
+		if value < summary.Min || value > summary.Max {
+			t.Errorf("%s = %v outside [Min=%v, Max=%v]", name, value, summary.Min, summary.Max)
+		}
+	}
 }
 
 func TestSummaryOnNilAndEmptyTracer(t *testing.T) {

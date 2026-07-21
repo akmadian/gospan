@@ -174,6 +174,43 @@ func TestSlogSinkDiscardsOpenSpansOnClose(t *testing.T) {
 	}
 }
 
+func TestSlogSinkOpenMapIsCapped(t *testing.T) {
+	// Sustained dropped end events (many starts, no ends): without the cap
+	// the open map grows unbounded; with it, growth stops at
+	// maxOpenSlogSpans and a later end for an untracked span still emits.
+	handler := &recordingHandler{}
+	sink, ok := SlogSink(slog.New(handler)).(*slogSink)
+	if !ok {
+		t.Fatal("SlogSink must return a *slogSink")
+	}
+
+	starts := make([]Event, 0, maxOpenSlogSpans+100)
+	for i := 0; i < maxOpenSlogSpans+100; i++ {
+		id := int64(i + 1)
+		starts = append(starts, Event{Kind: EventStart, SpanID: id, TraceID: id, Name: "leaks"})
+	}
+	if err := sink.WriteBatch(Batch{Events: starts}); err != nil {
+		t.Fatalf("WriteBatch: %v", err)
+	}
+	if got := len(sink.open); got != maxOpenSlogSpans {
+		t.Errorf("open map holds %d entries, want it capped at %d", got, maxOpenSlogSpans)
+	}
+
+	// An end for a span past the cap (never tracked) must still emit a full
+	// record — end events carry Name and StartNS for exactly this.
+	untracked := int64(maxOpenSlogSpans + 50)
+	err := sink.WriteBatch(Batch{Events: []Event{{
+		Kind: EventEnd, SpanID: untracked, TraceID: untracked,
+		Name: "untracked", StartNS: 100, EndNS: 300, Status: SpanStatusOK,
+	}}})
+	if err != nil {
+		t.Fatalf("WriteBatch end: %v", err)
+	}
+	if records := handler.snapshot(); len(records) != 1 || records[0].message != "untracked" {
+		t.Fatalf("an end past the cap must still emit its record, got %v", records)
+	}
+}
+
 func TestMultiSinkFansOutInOrder(t *testing.T) {
 	first, second := &captureSink{}, &captureSink{}
 	tracer, err := New(MultiSink(first, second))
