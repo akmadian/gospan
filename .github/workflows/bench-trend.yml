@@ -26,12 +26,12 @@ jobs:
         run: |
           go test -bench . -benchmem -run '^$' ./... | tee /tmp/bench.txt
           cd sqlite && go test -bench . -benchmem -run '^$' ./... | tee -a /tmp/bench.txt
-      - uses: benchmark-action/github-action-benchmark@v1
-        with:
-          tool: go
-          output-file-path: /tmp/bench.txt
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          auto-push: true
-          alert-threshold: "150%"
-          comment-on-alert: true
-          fail-on-alert: false
+      # - uses: benchmark-action/github-action-benchmark@v1
+      #   with:
+      #     tool: go
+      #     output-file-path: /tmp/bench.txt
+      #     github-token: ${{ secrets.GITHUB_TOKEN }}
+      #     auto-push: true
+      #     alert-threshold: "150%"
+      #     comment-on-alert: true
+      #     fail-on-alert: false

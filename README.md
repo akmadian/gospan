@@ -3,7 +3,6 @@
 *Embedded span tracing for Go. Zero-dependency core; spans to your slog logger or a queryable SQLite file.*
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/akmadian/gospan.svg)](https://pkg.go.dev/github.com/akmadian/gospan)
-[![Go Report Card](https://goreportcard.com/badge/github.com/akmadian/gospan)](https://goreportcard.com/report/github.com/akmadian/gospan)
 [![CI](https://github.com/akmadian/gospan/actions/workflows/ci.yml/badge.svg)](https://github.com/akmadian/gospan/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
