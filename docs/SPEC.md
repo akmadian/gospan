@@ -182,6 +182,15 @@ CREATE TABLE attrs (
     value   ANY,                        -- SQLite cells are natively typed
     PRIMARY KEY (span_id, key)
 ) STRICT, WITHOUT ROWID;
+
+-- Convenience view (additive; no schema_version bump — D27). Resolves the
+-- names join and the derived duration every human query needs; readers that
+-- only want the tables ignore it. duration_ns is NULL while end_ns is NULL.
+CREATE VIEW spans_named AS
+    SELECT s.id, s.trace_id, s.parent_id, n.name,
+           s.start_ns, s.end_ns, s.end_ns - s.start_ns AS duration_ns,
+           s.status, s.error
+    FROM spans s JOIN names n ON n.id = s.name_id;
 ```
 
 Write path: span row inserted at first flush after `Start` (`end_ns` NULL);
@@ -215,7 +224,9 @@ cross-query.
   meaning.
 - Status enum values are frozen (`0/1/2`); additions append.
 - The viewer must tolerate: NULL `end_ns`, missing parents (render at top
-  level, flagged), unknown `kind` values (render raw), and files larger than
+  level, flagged), unknown `kind` values (render raw), additive schema
+  objects it does not recognize (a new view like `spans_named`, or — under a
+  `schema_version` bump — new tables/columns), and files larger than
   comfortable (degrade, don't crash — the WASM engine loads files fully into
   browser memory; this tool is for single-run and modest multi-run analysis,
   not a warehouse).

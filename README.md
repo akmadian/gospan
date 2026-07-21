@@ -7,7 +7,11 @@
 [![CI](https://github.com/akmadian/gospan/actions/workflows/ci.yml/badge.svg)](https://github.com/akmadian/gospan/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
-gospan shows you where a Go program spends its time. Wrap the slow-looking parts in named spans; each is two allocations — a deterministic, enforced ceiling — and runs about 2.3× faster than OpenTelemetry's cheapest configuration at a sixth the memory, so you leave them in. Spans go to your slog logger, or to a SQLite file a background goroutine writes without ever blocking your code — then you query them with plain SQL. It's for one process on your machine, not a fleet. No collector, no agent, no CGO.
+[Quickstart & Examples](#quickstart) | [Overhead](#overhead) | [Configuration](#configuration) | [FAQ](#faq)
+
+gospan shows you where a Go program spends its time. Wrap the slow-looking parts in named spans, which can be nested using the Context object you already use pretty much everywhere. Each span costs two heap allocations and, in actual code, ~2μs - ~2.3× faster than OpenTelemetry's cheapest configuration at a sixth the memory, so you can leave them in your code without worrying about overhead. Spans can go to your slog logger, or to a SQLite db, which you can then query with plain SQL. It's for in-process tracing, not a distributed fleet. No collector, no agent, no CGO. Gospan is crash safe, and won't block (unless you want) or crash your program - error boundaries and degradation paths are strictly enforced and tested.
+
+![gospan-demo: one run, logged live and queried as SQL](docs/demo.jpg)
 
 > **Pre-1.0.** The file format (SPEC §3–§5) is a frozen, cross-version contract; the Go API may still shift before 1.0. Implemented, tested, and validated in Alexandria, a real import pipeline. Testers and contributions welcome — help me find where it falls short.
 >
@@ -17,7 +21,7 @@ gospan shows you where a Go program spends its time. Wrap the slow-looking parts
 
 Logs tell you what happened, not where the time went. Metrics need a server. `go tool trace` shows the Go scheduler, not your code. OpenTelemetry is built for tracing across services — overkill when one program is slow and you just want to know why. gospan fills that gap: name the operations you care about and read their timing right where you already look.
 
-## What it's for
+## What it's for - uses
 
 Anything with a start and an end:
 
@@ -41,6 +45,9 @@ hands the span to a bounded buffer; a single background goroutine drains
 the buffer to the destination.
 If the buffer is full, the event is dropped and counted — never blocking
 your code — unless you opt into blocking instead.
+
+---
+<a name="quickstart">
 
 ## Quickstart & Examples
 
@@ -81,6 +88,7 @@ func render(ctx context.Context, data Rows) error {
 
 ### Or trace to a file
 
+Add the sqlite module
 ```sh
 go get github.com/akmadian/gospan/sqlite
 ```
@@ -202,6 +210,8 @@ More recipes — subprocess leaves, fan-in batches — in
 - Graceful `Close` loses nothing; a hard kill loses at most one flush
   interval (default 1s).
 
+<a name="overhead">
+
 ## Overhead
 
 Measured on Apple M1, Go 1.26, medians of 5 runs. The allocation counts are deterministic (ns/op is not) and a function of gospan's architecture — the test suite enforces them as ceilings, so they hold on every machine:
@@ -251,13 +261,16 @@ In-tree: `gospan.SlogSink` (spans into your existing log flow),
 destinations belong in third-party modules — the seam is three methods
 wide.
 
-## Tuning
+<a name="configuration">
+
+## Tuning and Configuration
 
 Defaults are drop-in-and-forget; every knob exists because some workload
 disagrees:
 
 ```go
-tracer, err := gospan.New(sink,
+tracer, err := gospan.New(
+    sink,
     gospan.WithBufferSize(8192),           // event buffer; full = drop and count
     gospan.WithFlushInterval(time.Second), // durability heartbeat: a hard kill loses ≤ this
     gospan.WithBlockingPolicy(),           // block producers instead of dropping
@@ -275,6 +288,7 @@ tracer, err := gospan.New(sink,
 - [docs/DEFERRED.md](docs/DEFERRED.md) — what's consciously not in v1, and
   what would trigger it
 
+<a name="faq">
 ## FAQ
 
 **Can I leave spans in and turn tracing off?**

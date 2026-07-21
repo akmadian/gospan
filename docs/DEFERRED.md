@@ -107,9 +107,17 @@ at a time, so parallel flushers on one file only queue on the lock. Batch
 size per tx is past its amortization knee at flush-interval sizes — it moves
 latency, not the ceiling. The ladder, in order:
 
-1. **Multi-row `VALUES` inserts** (prepared, N rows/statement) — cuts
-   per-row VM entries; the only move that changes marginal cost. 2–5×,
-   no doctrine cost.
+1. **Reuse one prepared statement across flushes** (unbuilt; the promising
+   lever). The pure-Go driver's dominant per-flush cost is statement
+   *compilation*, so preparing the span upsert and attr replace once and
+   re-executing them each flush — rather than `tx.Prepare` per flush —
+   targets the actual bottleneck. Needs measurement and care: prepared-
+   statement lifecycle across `database/sql` transactions has subtleties.
+   *Multi-row `VALUES` inserts were the original step 1 and are now rejected
+   on measurement (D28): benchmarked ~44% **slower** on `modernc.org/sqlite`
+   — parsing a 1024-placeholder statement per flush costs more CPU than the
+   per-row stepping it saves, even while halving allocations. The "2–5×, no
+   doctrine cost" was CGO-world intuition the pure-Go VM inverts.*
 2. **Sink-internal double-buffered commit** — the single-goroutine contract
    governs calls INTO the sink; a private committer goroutine + buffer swap
    overlaps commit with intake, removing the flush-window backpressure spike.
@@ -189,3 +197,6 @@ first-day analysis experience Alexandria hand-rolled in `cmd/dev/sql/`.
 same queries — or fold the generic half of Alexandria's kit upstream when
 the viewer round starts, since the viewer needs the same canned queries
 anyway.
+*Shipped 2026-07-17 (pre-1.0 testing round): the `spans_named` view (D27)
+and `sqlite/scripts/` (`by-name`, `slowest-spans`, `triage`, `parallelism`).
+The domain-specific stage-gap "queue map" stays out; the generic kit is in.*

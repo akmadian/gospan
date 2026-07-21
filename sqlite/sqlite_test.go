@@ -153,6 +153,37 @@ func TestSchemaIsStrictAndWAL(t *testing.T) {
 	}
 }
 
+func TestSpansNamedView(t *testing.T) {
+	sink := newTestSink(t)
+	writeAndFlush(t, sink, startEvent(1, "extract"), endEvent(1, "extract"))
+	writeAndFlush(t, sink, startEvent(2, "running")) // no end
+
+	db := openForInspection(t, sink.Path())
+
+	// A completed span exposes its name and a derived duration directly.
+	var name string
+	var durationNS sql.NullInt64
+	err := db.QueryRow("SELECT name, duration_ns FROM spans_named WHERE id = 1").Scan(&name, &durationNS)
+	if err != nil {
+		t.Fatalf("querying spans_named: %v", err)
+	}
+	if name != "extract" {
+		t.Errorf("spans_named.name = %q, want extract", name)
+	}
+	if !durationNS.Valid || durationNS.Int64 != 500 {
+		t.Errorf("spans_named.duration_ns = %+v, want 500 (1500 - 1000)", durationNS)
+	}
+
+	// A running span exposes NULL duration — end_ns IS NULL propagates.
+	var runningDuration sql.NullInt64
+	if err := db.QueryRow("SELECT duration_ns FROM spans_named WHERE id = 2").Scan(&runningDuration); err != nil {
+		t.Fatal(err)
+	}
+	if runningDuration.Valid {
+		t.Error("a running span must expose NULL duration_ns through the view")
+	}
+}
+
 func TestOpenReadHandle_ReadsLiveAndRefusesWrites(t *testing.T) {
 	sink := newTestSink(t)
 	// A span written through the sink's own path, mid-run (file not closed).
@@ -185,4 +216,99 @@ func TestOpenReadHandle_ReadsLiveAndRefusesWrites(t *testing.T) {
 	if _, err := db.Exec(`INSERT INTO names (id, name) VALUES (99, 'intruder')`); err == nil {
 		t.Fatal("a write through the read handle must fail — the handle is not read-only")
 	}
+}
+
+func TestWithNameUsesTheGivenName(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "traces")
+	sink, err := New(dir, WithName("run-42.sqlite", false))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = sink.Close() })
+
+	if base := filepath.Base(sink.Path()); base != "run-42.sqlite" {
+		t.Errorf("Path() base = %q, want run-42.sqlite", base)
+	}
+	if got := filepath.Dir(sink.Path()); got != dir {
+		t.Errorf("a relative name must land inside dir: Path() dir = %q, want %q", got, dir)
+	}
+	if _, err := os.Stat(sink.Path()); err != nil {
+		t.Errorf("the named file must exist: %v", err)
+	}
+}
+
+func TestWithNameAbsolutePathIgnoresDir(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "elsewhere", "trace.sqlite")
+	// dir is a different, unrelated directory: an absolute name must win.
+	sink, err := New(filepath.Join(t.TempDir(), "ignored"), WithName(target, false))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = sink.Close() })
+
+	if sink.Path() != target {
+		t.Errorf("Path() = %q, want the absolute name %q", sink.Path(), target)
+	}
+}
+
+func TestWithNameCollisionIsAnErrorByDefault(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "traces")
+	first, err := New(dir, WithName("shared.sqlite", false))
+	if err != nil {
+		t.Fatalf("first New: %v", err)
+	}
+	t.Cleanup(func() { _ = first.Close() })
+
+	// A second run onto the same name, without overwrite, must refuse rather
+	// than clobber the first run's trace.
+	if _, err := New(dir, WithName("shared.sqlite", false)); err == nil {
+		t.Fatal("New must fail when the named file exists and overwrite is false")
+	}
+}
+
+func TestWithNameOverwriteReplacesTheFile(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "traces")
+	first, err := New(dir, WithName("shared.sqlite", false))
+	if err != nil {
+		t.Fatalf("first New: %v", err)
+	}
+	firstFileID := readFileID(t, first.Path())
+	_ = first.Close()
+
+	// overwrite=true replaces the file: a fresh trace (new file_id), and no
+	// "table already exists" error from re-running the schema onto the old one.
+	second, err := New(dir, WithName("shared.sqlite", true))
+	if err != nil {
+		t.Fatalf("overwriting New: %v", err)
+	}
+	t.Cleanup(func() { _ = second.Close() })
+
+	if second.Path() != first.Path() {
+		t.Errorf("overwrite must reuse the path: %q vs %q", second.Path(), first.Path())
+	}
+	if readFileID(t, second.Path()) == firstFileID {
+		t.Error("overwrite must mint a fresh file — an unchanged file_id means the old file survived")
+	}
+}
+
+func TestWithNameEmptyNameIsAnError(t *testing.T) {
+	if _, err := New(t.TempDir(), WithName("", false)); err == nil {
+		t.Fatal("WithName with an empty name must fail at construction")
+	}
+}
+
+// readFileID reads meta.file_id from a finished trace file over a short-lived
+// read-only connection, so it never holds the file against a later overwrite.
+func readFileID(t *testing.T, path string) string {
+	t.Helper()
+	db, err := sql.Open("sqlite", "file:"+path+"?mode=ro")
+	if err != nil {
+		t.Fatalf("opening %s: %v", path, err)
+	}
+	defer func() { _ = db.Close() }()
+	var fileID string
+	if err := db.QueryRow("SELECT file_id FROM meta").Scan(&fileID); err != nil {
+		t.Fatalf("reading file_id from %s: %v", path, err)
+	}
+	return fileID
 }

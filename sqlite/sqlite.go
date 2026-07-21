@@ -60,6 +60,18 @@ CREATE TABLE attrs (
     value   ANY,
     PRIMARY KEY (span_id, key)
 ) STRICT, WITHOUT ROWID;
+
+-- spans_named resolves the names join every human query starts with and
+-- exposes the derived duration, so ad-hoc SQL and the shipped scripts read
+-- "name" and "duration_ns" directly. A view is additive — it changes no
+-- table and needs no schema_version bump — but it edits the frozen §3
+-- surface, so it is a deliberate versioned addition (D27). duration_ns is
+-- NULL while a span is running or incomplete (end_ns IS NULL).
+CREATE VIEW spans_named AS
+    SELECT s.id, s.trace_id, s.parent_id, n.name,
+           s.start_ns, s.end_ns, s.end_ns - s.start_ns AS duration_ns,
+           s.status, s.error
+    FROM spans s JOIN names n ON n.id = s.name_id;
 `
 
 // Sink writes trace events into one SQLite file. Construct with New; it
@@ -74,25 +86,68 @@ type Sink struct {
 	pendingSpans []*spanRow
 	pendingByID  map[int64]*spanRow // open pending rows, for start+end coalescing
 	pendingAttrs []attrRow
-	nameIDs      map[string]int64 // interned span names
+
+	// nameIDs holds committed interned names only. internedThisFlush holds
+	// names inserted inside the in-flight transaction; they are promoted
+	// into nameIDs only after the commit succeeds, so a rolled-back flush
+	// can never leave nameIDs pointing at a names row that no longer exists.
+	nameIDs           map[string]int64
+	internedThisFlush map[string]int64
 }
 
-// New creates dir if absent, mints one auto-named trace file inside it
-// (gospan-<utc-timestamp>-<pid>.sqlite — no two runs ever share a file,
-// so no collision semantics exist; old runs accumulate as siblings for
-// ATTACH-style comparison, D17), and prepares the schema. Construction is
-// where every error surfaces (D23): a Sink you receive is ready to write.
-func New(dir string) (*Sink, error) {
-	// 0o750, not 0o755: trace files can carry sensitive attribute values
-	// (paths, identifiers), so the directory defaults to no world access.
-	if err := os.MkdirAll(dir, 0o750); err != nil {
-		return nil, fmt.Errorf("gospan/sqlite: creating trace directory: %w", err)
+// Option configures a Sink at construction. With no options, New writes one
+// auto-named file per run; WithName overrides that.
+type Option func(*config)
+
+// config is the resolved set of options.
+type config struct {
+	name      string
+	named     bool // WithName was passed — distinguishes an empty name from none
+	overwrite bool
+}
+
+// WithName writes the run to a file you name, instead of the auto-generated
+// gospan-<utc-timestamp>-<pid>.sqlite. A relative name lands inside dir; an
+// absolute path is used as-is (dir is then ignored for the file's location).
+// The name is taken verbatim — no extension is appended, so include
+// ".sqlite" yourself if you want it.
+//
+// By default a name that already exists is an error at construction, so a
+// rerun never silently destroys the previous run's trace. Pass overwrite=true
+// to replace it — the old file and its -wal/-shm sidecars are removed first.
+// Appending two runs into one file is deliberately not offered: it would fold
+// their IDs together, defeating the per-file file_id design (D2).
+func WithName(name string, overwrite bool) Option {
+	return func(cfg *config) {
+		cfg.name = name
+		cfg.named = true
+		cfg.overwrite = overwrite
+	}
+}
+
+// New prepares a trace file and returns a Sink ready to write. With no
+// options it mints one auto-named file inside dir
+// (gospan-<utc-timestamp>-<pid>.sqlite — no two runs ever share a file, so
+// old runs accumulate as siblings for ATTACH-style comparison, D17);
+// WithName overrides the name and its collision policy. The target directory
+// is created if absent. Construction is where every error surfaces (D23): a
+// Sink you receive is ready to write.
+func New(dir string, options ...Option) (*Sink, error) {
+	cfg := config{}
+	for _, option := range options {
+		option(&cfg)
 	}
 
-	// Nanosecond timestamp plus PID: unique even for two tracers built in
-	// the same process in the same second.
-	startedAt := time.Now().UTC().Format("20060102T150405.000000000Z")
-	path := filepath.Join(dir, fmt.Sprintf("gospan-%s-%d.sqlite", startedAt, os.Getpid()))
+	path, err := resolvePath(dir, cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	// 0o750, not 0o755: trace files can carry sensitive attribute values
+	// (paths, identifiers), so the directory defaults to no world access.
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+		return nil, fmt.Errorf("gospan/sqlite: creating trace directory: %w", err)
+	}
 
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -110,11 +165,56 @@ func New(dir string) (*Sink, error) {
 		return nil, fmt.Errorf("gospan/sqlite: initializing %s: %w", path, errors.Join(err, closeErr, removeErr))
 	}
 	return &Sink{
-		db:          db,
-		path:        path,
-		pendingByID: make(map[int64]*spanRow),
-		nameIDs:     make(map[string]int64),
+		db:                db,
+		path:              path,
+		pendingByID:       make(map[int64]*spanRow),
+		nameIDs:           make(map[string]int64),
+		internedThisFlush: make(map[string]int64),
 	}, nil
+}
+
+// resolvePath applies the naming and collision rules and returns the file
+// New should open. The auto-name carries all its uniqueness in the name
+// itself, so it never collides; a WithName file is checked here, before any
+// file is touched, so an unwanted overwrite fails at construction.
+func resolvePath(dir string, cfg config) (string, error) {
+	if !cfg.named {
+		// Nanosecond timestamp plus PID: unique even for two tracers built
+		// in the same process in the same second.
+		startedAt := time.Now().UTC().Format("20060102T150405.000000000Z")
+		return filepath.Join(dir, fmt.Sprintf("gospan-%s-%d.sqlite", startedAt, os.Getpid())), nil
+	}
+
+	if cfg.name == "" {
+		return "", errors.New("gospan/sqlite: WithName given an empty name")
+	}
+	path := cfg.name
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(dir, path)
+	}
+
+	info, err := os.Stat(path)
+	switch {
+	case err == nil:
+		if info.IsDir() {
+			return "", fmt.Errorf("gospan/sqlite: %s is a directory, not a trace file", path)
+		}
+		if !cfg.overwrite {
+			return "", fmt.Errorf("gospan/sqlite: %s already exists; pass WithName's overwrite=true to replace it", path)
+		}
+		// Overwrite: remove the file and its write-ahead sidecars, so the
+		// replacement never inherits a stale WAL from the run it replaced.
+		for _, sidecar := range []string{path, path + "-wal", path + "-shm"} {
+			if err := os.Remove(sidecar); err != nil && !os.IsNotExist(err) {
+				return "", fmt.Errorf("gospan/sqlite: replacing %s: %w", path, err)
+			}
+		}
+	case !os.IsNotExist(err):
+		// Stat failed for a reason other than absence (a permission problem
+		// on a path component, say): surface it now, at construction.
+		return "", fmt.Errorf("gospan/sqlite: checking %s: %w", path, err)
+	}
+	return path, nil
 }
 
 // initialize applies the pragmas, the schema, and the one-row meta table

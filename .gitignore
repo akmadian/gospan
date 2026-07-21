@@ -27,3 +27,6 @@ profile.cov
 # Editor/IDE
 # .idea/
 .vscode/
+
+# gospan-demo writes its trace file into the working directory
+gospan-demo.sqlite*
