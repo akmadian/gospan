@@ -251,6 +251,21 @@ func TestWithNameAbsolutePathIgnoresDir(t *testing.T) {
 	}
 }
 
+func TestPathIsAbsoluteFromARelativeDir(t *testing.T) {
+	// A relative dir must still yield an absolute Path(), resolved at
+	// construction so it survives a later os.Chdir and is safe to hand off.
+	t.Chdir(t.TempDir()) // isolate: the relative dir lands under the temp cwd
+	sink, err := New("traces")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = sink.Close() })
+
+	if !filepath.IsAbs(sink.Path()) {
+		t.Errorf("Path() = %q, want an absolute path", sink.Path())
+	}
+}
+
 func TestWithNameCollisionIsAnErrorByDefault(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "traces")
 	first, err := New(dir, WithName("shared.sqlite", false))

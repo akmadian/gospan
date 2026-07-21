@@ -202,6 +202,20 @@ The SQLite sink also takes `sqlite.WithName(name, overwrite)` for a stable file 
 **Isn't this just OpenTelemetry?**
 OTel does distributed tracing across services, with a collector and an SDK dependency tree. gospan is the opposite on purpose: one process, zero core dependencies, a plain SQLite file at the end. Need cross-service traces? Use OTel. Need to know where one program's time goes? `go get` and two calls. (An OTel adapter is [deferred](docs/DEFERRED.md), not rejected — it would feed OTel spans into gospan's file + viewer.)
 
+**Can I combine traces from multiple runs or hosts?**
+Yes, unofficially — the files are plain SQLite, so `ATTACH` them and query the union. Two rules keep it honest:
+
+- **Namespace by `file_id`.** Span and trace IDs are per-file counters (every file starts at 1, so they collide across files); each file's random `file_id` (in its `meta` table) is the real key — group and join on `(file_id, id)`, never `id` alone.
+- **Clocks aren't aligned across machines.** Durations (`end_ns - start_ns`) are exact within a file, but absolute cross-host ordering is only as good as the hosts' NTP sync (see [SPEC §4](docs/SPEC.md)).
+
+```sql
+ATTACH 'run2.sqlite' AS r2;
+SELECT (SELECT file_id FROM meta) AS file_id, * FROM spans_named
+UNION ALL SELECT (SELECT file_id FROM r2.meta), * FROM r2.spans_named;
+```
+
+You get pooled, per-file-coherent analysis — per-host trees, aggregate durations, cross-run comparisons — not one causal trace spanning hosts. It's post-hoc multi-file analysis, not distributed tracing (there's no propagation).
+
 **Why a separate attrs table? Doesn't querying attributes need a join?**
 Attribute keys are yours to choose and unbounded, so they can't be fixed columns. The one alternative — a JSON blob on the span row — corrupts data: JSON's only number is float64, so int64 attributes past 2⁵³ (byte counts, nanosecond values) silently round off, and a late `SetAttrs` becomes read-modify-write on the blob. A key/value table stores each value at its exact type and keeps writes a single upsert. Most queries (durations, percentiles, failures) never touch attributes; the ones that do get the `spans_named` view or a one-line join.
 

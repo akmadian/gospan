@@ -142,6 +142,16 @@ func New(dir string, options ...Option) (*Sink, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Path() reports an absolute path: resolved once here against the cwd at
+	// construction, so a later os.Chdir can't make it dangle and it is safe to
+	// log or hand to a sqlite3 session. Abs also cleans the path. resolvePath's
+	// collision check already ran against the same file — a relative and an
+	// absolute spelling of one path stat the same inode.
+	absolutePath, err := filepath.Abs(path)
+	if err != nil {
+		return nil, fmt.Errorf("gospan/sqlite: resolving %s to an absolute path: %w", path, err)
+	}
+	path = absolutePath
 
 	// 0o750, not 0o755: trace files can carry sensitive attribute values
 	// (paths, identifiers), so the directory defaults to no world access.
@@ -251,7 +261,9 @@ func initialize(db *sql.DB) error {
 	return nil
 }
 
-// Path reports where this run's trace file landed.
+// Path reports the absolute path of this run's trace file. It is resolved at
+// construction, so it stays valid across a later os.Chdir and is safe to log
+// or hand to another tool (a sqlite3 session, say).
 func (sink *Sink) Path() string {
 	return sink.path
 }
